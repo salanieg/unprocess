@@ -168,12 +168,12 @@ class CameraFragment : Fragment() {
         updateFlashUI()
         setupLensSelector()
 
-        fragmentCameraBinding.modeToggle.setOnClickListener {
+        fragmentCameraBinding.modeToggle?.setOnClickListener {
             isJpeg = !isJpeg
             updateModeToggleUI()
         }
 
-        fragmentCameraBinding.flashToggle.setOnClickListener {
+        fragmentCameraBinding.flashToggle?.setOnClickListener {
             flashMode = if (flashMode == CaptureRequest.CONTROL_AE_MODE_ON_ALWAYS_FLASH) {
                 CaptureRequest.CONTROL_AE_MODE_ON
             } else {
@@ -199,15 +199,18 @@ class CameraFragment : Fragment() {
             }
         }
 
-        val navOffsetListener = View.OnApplyWindowInsetsListener { v, insets ->
-            v.translationX = (-insets.systemWindowInsetRight).toFloat()
-            v.translationY = (-insets.systemWindowInsetBottom).toFloat()
-            insets.consumeSystemWindowInsets()
+        val navOffsetListener = androidx.core.view.OnApplyWindowInsetsListener { v, insets ->
+            val systemBars = insets.getInsets(androidx.core.view.WindowInsetsCompat.Type.systemBars())
+            v.translationX = (-systemBars.right).toFloat()
+            v.translationY = (-systemBars.bottom).toFloat()
+            androidx.core.view.WindowInsetsCompat.CONSUMED
         }
-        fragmentCameraBinding.captureButton.setOnApplyWindowInsetsListener(navOffsetListener)
-        fragmentCameraBinding.galleryButton.setOnApplyWindowInsetsListener(navOffsetListener)
+        androidx.core.view.ViewCompat.setOnApplyWindowInsetsListener(fragmentCameraBinding.captureButton, navOffsetListener)
+        fragmentCameraBinding.galleryButton?.let {
+            androidx.core.view.ViewCompat.setOnApplyWindowInsetsListener(it, navOffsetListener)
+        }
 
-        fragmentCameraBinding.galleryButton.setOnClickListener {
+        fragmentCameraBinding.galleryButton?.setOnClickListener {
             openRecentPhoto()
         }
 
@@ -237,7 +240,7 @@ class CameraFragment : Fragment() {
     }
 
     private fun updateModeToggleUI() {
-        fragmentCameraBinding.modeToggle.text = if (isJpeg) "JPEG" else "RAW"
+        fragmentCameraBinding.modeToggle?.text = if (isJpeg) "JPEG" else "RAW"
     }
 
     private fun updateFlashUI() {
@@ -246,15 +249,15 @@ class CameraFragment : Fragment() {
         } else {
             R.drawable.ic_flash_off
         }
-        fragmentCameraBinding.flashToggle.text = ""
-        fragmentCameraBinding.flashToggle.setIconResource(iconRes)
+        fragmentCameraBinding.flashToggle?.text = ""
+        fragmentCameraBinding.flashToggle?.setIconResource(iconRes)
     }
 
     private var allCameraIds: List<String> = emptyList()
 
     private fun setupLensSelector() {
         val container = fragmentCameraBinding.lensSelectorContainer
-        container.removeAllViews()
+        container?.removeAllViews()
 
         val ids = mutableListOf<String>()
         Log.d(TAG, "All cameras found on device: ${cameraManager.cameraIdList.joinToString()}")
@@ -353,12 +356,12 @@ class CameraFragment : Fragment() {
         Log.d(TAG, "Final processed cameras: ${finalCameras.joinToString()}")
 
         if (allCameraIds.isEmpty()) {
-            fragmentCameraBinding.lensSelectorCard.visibility = View.GONE
+            fragmentCameraBinding.lensSelectorCard?.visibility = View.GONE
             return
         }
-        fragmentCameraBinding.lensSelectorCard.visibility = View.VISIBLE
+        fragmentCameraBinding.lensSelectorCard?.visibility = View.VISIBLE
 
-        finalCameras.forEach { (id, focal, label) ->
+        finalCameras.forEach { (id, _, label) ->
             val button = com.google.android.material.button.MaterialButton(
                 requireContext(),
                 null,
@@ -385,7 +388,7 @@ class CameraFragment : Fragment() {
                     }
                 }
             }
-            container.addView(button)
+            container?.addView(button)
         }
         updateLensHighlight()
     }
@@ -412,13 +415,14 @@ class CameraFragment : Fragment() {
 
     private fun reEnableUI() {
         fragmentCameraBinding.captureButton.isEnabled = true
-        for (i in 0 until fragmentCameraBinding.lensSelectorContainer.childCount) {
-            fragmentCameraBinding.lensSelectorContainer.getChildAt(i).isEnabled = true
+        val count = fragmentCameraBinding.lensSelectorContainer?.childCount ?: 0
+        for (i in 0 until count) {
+            fragmentCameraBinding.lensSelectorContainer?.getChildAt(i)?.isEnabled = true
         }
     }
 
     private fun updateLensHighlight() {
-        val container = fragmentCameraBinding.lensSelectorContainer
+        val container = fragmentCameraBinding.lensSelectorContainer ?: return
         for (i in 0 until container.childCount) {
             val button = container.getChildAt(i) as com.google.android.material.button.MaterialButton
             val cameraId = allCameraIds.getOrNull(i)
@@ -513,8 +517,10 @@ class CameraFragment : Fragment() {
         // Disable UI during initialization
         fragmentCameraBinding.captureButton.isEnabled = false
         // Disable lens buttons to prevent rapid switching
-        for (i in 0 until fragmentCameraBinding.lensSelectorContainer.childCount) {
-            fragmentCameraBinding.lensSelectorContainer.getChildAt(i).isEnabled = false
+        // Disable lens buttons to prevent rapid switching
+        val count = fragmentCameraBinding.lensSelectorContainer?.childCount ?: 0
+        for (i in 0 until count) {
+            fragmentCameraBinding.lensSelectorContainer?.getChildAt(i)?.isEnabled = false
         }
 
         cameraJob = lifecycleScope.launch(Dispatchers.Main) {
@@ -550,33 +556,54 @@ class CameraFragment : Fragment() {
                     size.width, size.height, format, IMAGE_BUFFER_SIZE
                 )
 
-                // Selects appropriate preview size and configures view finder
+                // Get the largest preview size that matches the capture aspect ratio
+                // This ensures the viewfinder shows the full sensor field of view
                 val captureRatio = size.width.toFloat() / size.height.toFloat()
-                val previewSize = getPreviewOutputSize(
-                    fragmentCameraBinding.viewFinder.display,
-                    characteristics,
-                    SurfaceHolder::class.java,
-                    aspectRatio = captureRatio
-                )
+                
+                // Log all available preview sizes for debugging
+                val allPreviewSizes = streamMap.getOutputSizes(SurfaceHolder::class.java)
+                Log.d(TAG, "Capture size: ${size.width}x${size.height}, ratio: $captureRatio")
+                
+                // Filter to sizes matching the capture aspect ratio
+                val matchingPreviewSizes = allPreviewSizes.filter { previewSize ->
+                    val ratio = previewSize.width.toFloat() / previewSize.height.toFloat()
+                    Math.abs(ratio - captureRatio) < 0.01f || Math.abs((1f/ratio) - captureRatio) < 0.01f
+                }.sortedByDescending { it.width * it.height }
+                
+                // Use the largest matching size, or fall back to the capture size itself
+                val previewSize = matchingPreviewSizes.firstOrNull() ?: size
+                
+                val previewRatio = previewSize.width.toFloat() / previewSize.height.toFloat()
+                Log.d(TAG, "Selected preview: ${previewSize.width}x${previewSize.height}, ratio: $previewRatio")
+                
+                // Set the viewfinder to the preview size
                 fragmentCameraBinding.viewFinder.setAspectRatio(
                     previewSize.width,
                     previewSize.height
                 )
 
-                // Match the container to the camera aspect ratio to avoid black bars
-                // Check if we are in portrait or landscape relative to the sensor
+                // Match the container to the same aspect ratio
+                val sensorOrientation = characteristics.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 0
                 val rotation = fragmentCameraBinding.viewFinder.display.rotation
-                val isLandscape = rotation == Surface.ROTATION_90 || rotation == Surface.ROTATION_270
-                
-                // Sensor orientation is usually 90 for back camera on phones
-                // But we just care about the output image aspect ratio vs the screen
-                val ratio = if (isLandscape) {
-                    "${previewSize.width}:${previewSize.height}"
-                } else {
-                    "${previewSize.height}:${previewSize.width}"
+                val deviceRotation = when (rotation) {
+                    Surface.ROTATION_0 -> 0
+                    Surface.ROTATION_90 -> 90
+                    Surface.ROTATION_180 -> 180
+                    Surface.ROTATION_270 -> 270
+                    else -> 0
                 }
                 
-                Log.d(TAG, "Setting view_finder_container ratio to $ratio")
+                // Determine if we need to swap width/height based on sensor and device orientation
+                val totalRotation = (sensorOrientation + deviceRotation) % 360
+                val needsSwap = (totalRotation == 90 || totalRotation == 270)
+                
+                val ratio = if (needsSwap) {
+                    "${previewSize.height}:${previewSize.width}"
+                } else {
+                    "${previewSize.width}:${previewSize.height}"
+                }
+                
+                Log.d(TAG, "Container ratio: $ratio (sensor: $sensorOrientation°, device: $deviceRotation°, total: $totalRotation°, swap: $needsSwap)")
 
                 val constraintSet = androidx.constraintlayout.widget.ConstraintSet()
                 constraintSet.clone(fragmentCameraBinding.root as androidx.constraintlayout.widget.ConstraintLayout)
@@ -740,12 +767,14 @@ class CameraFragment : Fragment() {
         ).apply { 
             addTarget(imageReader.surface)
             
-            // Set AE mode correctly for capture
-            set(CaptureRequest.CONTROL_AE_MODE, flashMode)
-            
-            // For some devices, we need to explicitly set FLASH_MODE when AE_MODE is ALWAYS_FLASH
+            // Set flash mode for capture
             if (flashMode == CaptureRequest.CONTROL_AE_MODE_ON_ALWAYS_FLASH) {
+                // Use FLASH_MODE_SINGLE for reliable flash triggering
+                set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
                 set(CaptureRequest.FLASH_MODE, CaptureRequest.FLASH_MODE_SINGLE)
+            } else {
+                set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
+                set(CaptureRequest.FLASH_MODE, CaptureRequest.FLASH_MODE_OFF)
             }
         }
         session.capture(captureRequest.build(), object : CameraCaptureSession.CaptureCallback() {
@@ -805,6 +834,8 @@ class CameraFragment : Fragment() {
                         val mirrored = characteristics.get(CameraCharacteristics.LENS_FACING) ==
                                 CameraCharacteristics.LENS_FACING_FRONT
                         val exifOrientation = computeExifOrientation(rotation, mirrored)
+                        
+                        Log.d(TAG, "EXIF orientation: rotation=$rotation°, mirrored=$mirrored, exifOrientation=$exifOrientation, cameraId=$currentCameraId")
 
                         // Build the result and resume progress
                         cont.resume(
