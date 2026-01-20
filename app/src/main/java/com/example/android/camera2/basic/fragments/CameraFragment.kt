@@ -31,9 +31,11 @@ import android.hardware.camera2.TotalCaptureResult
 import android.media.Image
 import android.media.ImageReader
 import android.os.Build
+import android.content.Intent
 import android.os.Bundle
 import android.os.Handler
 import android.os.HandlerThread
+import android.widget.Toast
 import android.util.Log
 import android.view.LayoutInflater
 import android.view.Surface
@@ -79,6 +81,8 @@ import androidx.core.content.ContextCompat
 import java.io.OutputStream
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.widget.LinearLayout
+import android.hardware.camera2.CameraMetadata
 
 class CameraFragment : Fragment() {
 
@@ -102,9 +106,8 @@ class CameraFragment : Fragment() {
     }
 
     /** [CameraCharacteristics] corresponding to the provided Camera ID */
-    private val characteristics: CameraCharacteristics by lazy {
-        cameraManager.getCameraCharacteristics(args.cameraId)
-    }
+    private val characteristics: CameraCharacteristics
+        get() = cameraManager.getCameraCharacteristics(currentCameraId)
 
     /** Readers used as buffers for camera still shots */
     private lateinit var imageReader: ImageReader
@@ -118,13 +121,10 @@ class CameraFragment : Fragment() {
     /** Performs recording animation of flashing screen */
     private val animationTask: Runnable by lazy {
         Runnable {
-            // Flash white animation
-            fragmentCameraBinding.overlay.background = Color.argb(150, 255, 255, 255).toDrawable()
-            // Wait for ANIMATION_FAST_MILLIS
-            fragmentCameraBinding.overlay.postDelayed({
-                // Remove white flash animation
-                fragmentCameraBinding.overlay.background = null
-            }, CameraActivity.ANIMATION_FAST_MILLIS)
+            // "Shutter closed" animation: Set overlay to opaque black and keep it
+            // This simulates the shutter closing and processing, hiding the freeze
+            fragmentCameraBinding.overlay.background = Color.BLACK.toDrawable()
+            fragmentCameraBinding.overlay.alpha = 1.0f
         }
     }
 
@@ -140,8 +140,15 @@ class CameraFragment : Fragment() {
     /** Internal reference to the ongoing [CameraCaptureSession] configured with our parameters */
     private lateinit var session: CameraCaptureSession
 
+    /** Job used to manage camera initialization */
+    private var cameraJob: kotlinx.coroutines.Job? = null
+
     /** Live data listener for changes in the device orientation relative to the camera */
     private lateinit var relativeOrientation: OrientationLiveData
+
+    private var currentCameraId: String = ""
+    private var isJpeg: Boolean = false
+    private var flashMode: Int = CaptureRequest.CONTROL_AE_MODE_ON
 
     override fun onCreateView(
         inflater: LayoutInflater,
@@ -155,10 +162,53 @@ class CameraFragment : Fragment() {
     @SuppressLint("MissingPermission")
     override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
         super.onViewCreated(view, savedInstanceState)
-        fragmentCameraBinding.captureButton.setOnApplyWindowInsetsListener { v, insets ->
+        currentCameraId = args.cameraId
+        isJpeg = args.convertToJpeg
+        updateModeToggleUI()
+        updateFlashUI()
+        setupLensSelector()
+
+        fragmentCameraBinding.modeToggle.setOnClickListener {
+            isJpeg = !isJpeg
+            updateModeToggleUI()
+        }
+
+        fragmentCameraBinding.flashToggle.setOnClickListener {
+            flashMode = if (flashMode == CaptureRequest.CONTROL_AE_MODE_ON_ALWAYS_FLASH) {
+                CaptureRequest.CONTROL_AE_MODE_ON
+            } else {
+                CaptureRequest.CONTROL_AE_MODE_ON_ALWAYS_FLASH
+            }
+            updateFlashUI()
+            
+            // Try to update the existing session if possible
+            try {
+                if (::session.isInitialized) {
+                        val captureRequest = camera.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
+                            addTarget(fragmentCameraBinding.viewFinder.holder.surface)
+                            set(CaptureRequest.CONTROL_AE_MODE, flashMode)
+                            // We don't use TORCH for standard flash toggle, common camera apps use strobe
+                        }
+                    session.setRepeatingRequest(captureRequest.build(), null, cameraHandler)
+                } else {
+                    initializeCamera()
+                }
+            } catch (exc: Exception) {
+                Log.e(TAG, "Failed to update flash mode on existing session, re-initializing", exc)
+                initializeCamera()
+            }
+        }
+
+        val navOffsetListener = View.OnApplyWindowInsetsListener { v, insets ->
             v.translationX = (-insets.systemWindowInsetRight).toFloat()
             v.translationY = (-insets.systemWindowInsetBottom).toFloat()
             insets.consumeSystemWindowInsets()
+        }
+        fragmentCameraBinding.captureButton.setOnApplyWindowInsetsListener(navOffsetListener)
+        fragmentCameraBinding.galleryButton.setOnApplyWindowInsetsListener(navOffsetListener)
+
+        fragmentCameraBinding.galleryButton.setOnClickListener {
+            openRecentPhoto()
         }
 
         fragmentCameraBinding.viewFinder.holder.addCallback(object : SurfaceHolder.Callback {
@@ -170,24 +220,7 @@ class CameraFragment : Fragment() {
                 width: Int,
                 height: Int
             ) = Unit
-
             override fun surfaceCreated(holder: SurfaceHolder) {
-                // Selects appropriate preview size and configures view finder
-                val previewSize = getPreviewOutputSize(
-                    fragmentCameraBinding.viewFinder.display,
-                    characteristics,
-                    SurfaceHolder::class.java
-                )
-                Log.d(
-                    TAG,
-                    "View finder size: ${fragmentCameraBinding.viewFinder.width} x ${fragmentCameraBinding.viewFinder.height}"
-                )
-                Log.d(TAG, "Selected preview size: $previewSize")
-                fragmentCameraBinding.viewFinder.setAspectRatio(
-                    previewSize.width,
-                    previewSize.height
-                )
-
                 // To ensure that size is set, initialize camera in the view's thread
                 view.post { initializeCamera() }
             }
@@ -199,7 +232,273 @@ class CameraFragment : Fragment() {
                 Log.d(TAG, "Orientation changed: $orientation")
             })
         }
+
+        // Capture button listener is handled in initializeCamera once the session is ready
     }
+
+    private fun updateModeToggleUI() {
+        fragmentCameraBinding.modeToggle.text = if (isJpeg) "JPEG" else "RAW"
+    }
+
+    private fun updateFlashUI() {
+        val iconRes = if (flashMode == CaptureRequest.CONTROL_AE_MODE_ON_ALWAYS_FLASH) {
+            R.drawable.ic_flash_on
+        } else {
+            R.drawable.ic_flash_off
+        }
+        fragmentCameraBinding.flashToggle.text = ""
+        fragmentCameraBinding.flashToggle.setIconResource(iconRes)
+    }
+
+    private var allCameraIds: List<String> = emptyList()
+
+    private fun setupLensSelector() {
+        val container = fragmentCameraBinding.lensSelectorContainer
+        container.removeAllViews()
+
+        val ids = mutableListOf<String>()
+        Log.d(TAG, "All cameras found on device: ${cameraManager.cameraIdList.joinToString()}")
+        
+        cameraManager.cameraIdList.forEach { id ->
+            val characteristics = cameraManager.getCameraCharacteristics(id)
+            val facing = characteristics.get(CameraCharacteristics.LENS_FACING)
+            val focalLengths = characteristics.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)
+            Log.d(TAG, "Camera ID: $id, Facing: $facing, Focal Lengths: ${focalLengths?.joinToString()}")
+            
+            // Check if it's a logical camera and has physical IDs
+            val physicalIds = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                characteristics.physicalCameraIds
+            } else {
+                emptySet()
+            }
+            
+            Log.d(TAG, "Camera ID: $id, Facing: $facing, Physical IDs: ${physicalIds.joinToString()}")
+            
+            if (physicalIds.isNotEmpty()) {
+                // Only include physical IDs that can be opened directly (are in the main camera list)
+                val openablePhysicalIds = physicalIds.filter { cameraManager.cameraIdList.contains(it) }
+                if (openablePhysicalIds.isNotEmpty()) {
+                    ids.addAll(openablePhysicalIds)
+                } else {
+                    // Fallback: If no physical cameras are directly openable, use the logical camera ID
+                    ids.add(id)
+                }
+            } else {
+                ids.add(id)
+            }
+        }
+        
+        // Detect unique cameras based on ID and focal lengths
+        val uniqueCameras = mutableListOf<Triple<String, Float, Boolean>>()
+        ids.distinct().forEach { id ->
+            val ch = cameraManager.getCameraCharacteristics(id)
+            val focal = ch.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)?.firstOrNull() ?: 0f
+            val isLogical = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                ch.physicalCameraIds.isNotEmpty()
+            } else false
+            
+            Log.d(TAG, "Processing ID for selector: $id, focal: $focal, isLogical: $isLogical")
+            uniqueCameras.add(Triple(id, focal, isLogical))
+        }
+        
+        // Filter out the logical camera if its physical counterparts are already present
+        val filteredCameras = uniqueCameras.filter { triple ->
+            if (triple.third) { // If it's logical
+                val physicalsOfThis = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                    cameraManager.getCameraCharacteristics(triple.first).physicalCameraIds
+                } else emptySet()
+                // If any of its physical children are in our list, exclude the logical one to avoid duplicates
+                physicalsOfThis.none { pId -> uniqueCameras.any { it.first == pId } }
+            } else true
+        }
+
+        val finalCameras = mutableListOf<Triple<String, Float, String>>() // ID, Focal, Label
+        
+        // 1. Sort the unique cameras by focal length
+        val sortedCameras = filteredCameras.sortedBy { it.second }
+        
+        // 2. Build labels with more detail and avoid duplicates
+        val usedLabels = mutableSetOf<String>()
+        sortedCameras.forEach { triple ->
+            val id = triple.first
+            val focal = triple.second
+            val ch = cameraManager.getCameraCharacteristics(id)
+            val facing = ch.get(CameraCharacteristics.LENS_FACING)
+            
+            var label = if (facing == CameraCharacteristics.LENS_FACING_FRONT) {
+                "F"
+            } else {
+                when {
+                    focal == 0f -> "CAM $id"
+                    focal < 2.5f -> "0.5x"
+                    focal < 3.5f -> "0.6x"
+                    focal < 9f -> "1x"
+                    focal < 12f -> "2x"
+                    focal < 20f -> "3x"
+                    focal < 30f -> "5x"
+                    else -> "${(focal / 4.3f).toInt()}x"
+                }
+            }
+            
+            // If label is duplicate, add index or ID
+            if (usedLabels.contains(label)) {
+                label = "$label ($id)"
+            }
+            usedLabels.add(label)
+            finalCameras.add(Triple(id, focal, label))
+        }
+
+        allCameraIds = finalCameras.map { it.first }
+        
+        Log.d(TAG, "Final processed cameras: ${finalCameras.joinToString()}")
+
+        if (allCameraIds.isEmpty()) {
+            fragmentCameraBinding.lensSelectorCard.visibility = View.GONE
+            return
+        }
+        fragmentCameraBinding.lensSelectorCard.visibility = View.VISIBLE
+
+        finalCameras.forEach { (id, focal, label) ->
+            val button = com.google.android.material.button.MaterialButton(
+                requireContext(),
+                null,
+                com.google.android.material.R.attr.materialButtonOutlinedStyle
+            ).apply {
+                text = label
+                layoutParams = LinearLayout.LayoutParams(
+                    44.dpToPx(),
+                    44.dpToPx()
+                ).apply {
+                    setMargins(4.dpToPx(), 4.dpToPx(), 4.dpToPx(), 4.dpToPx())
+                }
+                setPadding(0, 0, 0, 0)
+                insetTop = 0
+                insetBottom = 0
+                minWidth = 0
+                minHeight = 0
+                cornerRadius = 22.dpToPx()
+                strokeWidth = 0
+                
+                setOnClickListener {
+                    if (currentCameraId != id) {
+                        switchCamera(id)
+                    }
+                }
+            }
+            container.addView(button)
+        }
+        updateLensHighlight()
+    }
+
+    private fun releaseResources() {
+        try {
+            if (::session.isInitialized) {
+                session.stopRepeating()
+                session.close()
+            }
+            if (::camera.isInitialized) {
+                camera.close()
+            }
+            if (::imageReader.isInitialized) {
+                imageReader.close()
+            }
+        } catch (exc: Exception) {
+            Log.e(TAG, "Error releasing camera resources", exc)
+        } catch (exc: java.lang.IllegalStateException) {
+             // Ignored: Session has been closed; further changes are illegal.
+             Log.w(TAG, "Session already closed: ${exc.message}")
+        }
+    }
+
+    private fun reEnableUI() {
+        fragmentCameraBinding.captureButton.isEnabled = true
+        for (i in 0 until fragmentCameraBinding.lensSelectorContainer.childCount) {
+            fragmentCameraBinding.lensSelectorContainer.getChildAt(i).isEnabled = true
+        }
+    }
+
+    private fun updateLensHighlight() {
+        val container = fragmentCameraBinding.lensSelectorContainer
+        for (i in 0 until container.childCount) {
+            val button = container.getChildAt(i) as com.google.android.material.button.MaterialButton
+            val cameraId = allCameraIds.getOrNull(i)
+            if (cameraId == currentCameraId) {
+                button.setBackgroundColor(ContextCompat.getColor(requireContext(), R.color.secondary)) 
+                button.setTextColor(Color.BLACK)
+                button.alpha = 1.0f
+            } else {
+                button.setBackgroundColor(Color.parseColor("#33FFFFFF")) // 20% white
+                button.setTextColor(Color.WHITE)
+                button.alpha = 0.8f
+            }
+            button.strokeWidth = 0
+        }
+    }
+
+    private fun switchCamera(newId: String) {
+        if (currentCameraId == newId) return
+        
+        Log.d(TAG, "Switching camera to $newId")
+        currentCameraId = newId
+        
+        // Update highlight immediately for responsive feel
+        updateLensHighlight()
+        
+        // Cancel any pending camera operations and start fresh
+        initializeCamera()
+    }
+
+    private fun openRecentPhoto() {
+        val projection = arrayOf(
+            MediaStore.Images.Media._ID,
+            MediaStore.Images.Media.DATE_ADDED
+        )
+        val selection = "${MediaStore.Images.Media.RELATIVE_PATH} LIKE ?"
+        val selectionArgs = arrayOf("%DCIM/Camera%")
+        val sortOrder = "${MediaStore.Images.Media.DATE_ADDED} DESC"
+
+        val query = requireContext().contentResolver.query(
+            MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
+            projection,
+            selection,
+            selectionArgs,
+            sortOrder
+        )
+
+        query?.use { cursor ->
+            if (cursor.moveToFirst()) {
+                val idColumn = cursor.getColumnIndexOrThrow(MediaStore.Images.Media._ID)
+                val id = cursor.getLong(idColumn)
+                val contentUri = android.content.ContentUris.withAppendedId(
+                    MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
+                    id
+                )
+                val intent = Intent(Intent.ACTION_VIEW).apply {
+                    setDataAndType(contentUri, "image/*")
+                    flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_GRANT_READ_URI_PERMISSION
+                }
+                startActivity(intent)
+            } else {
+                // Fallback if no images found in DCIM/Camera
+                val intent = Intent(Intent.ACTION_VIEW, MediaStore.Images.Media.EXTERNAL_CONTENT_URI).apply {
+                    flags = Intent.FLAG_ACTIVITY_NEW_TASK
+                }
+                try {
+                    startActivity(intent)
+                } catch (e: Exception) {
+                    Toast.makeText(requireContext(), "No gallery app found", Toast.LENGTH_SHORT).show()
+                }
+            }
+        } ?: run {
+            // Fallback if query fails
+            val intent = Intent(Intent.ACTION_VIEW, MediaStore.Images.Media.EXTERNAL_CONTENT_URI).apply {
+                flags = Intent.FLAG_ACTIVITY_NEW_TASK
+            }
+            startActivity(intent)
+        }
+    }
+
+    private fun Int.dpToPx() = (this * resources.displayMetrics.density).toInt()
 
     /**
      * Begin all camera operations in a coroutine in the main thread. This function:
@@ -208,66 +507,150 @@ class CameraFragment : Fragment() {
      * - Starts the preview by dispatching a repeating capture request
      * - Sets up the still image capture listeners
      */
-    private fun initializeCamera() = lifecycleScope.launch(Dispatchers.Main) {
-        // Open the selected camera
-        camera = openCamera(cameraManager, args.cameraId, cameraHandler)
+    private fun initializeCamera() {
+        cameraJob?.cancel()
+        
+        // Disable UI during initialization
+        fragmentCameraBinding.captureButton.isEnabled = false
+        // Disable lens buttons to prevent rapid switching
+        for (i in 0 until fragmentCameraBinding.lensSelectorContainer.childCount) {
+            fragmentCameraBinding.lensSelectorContainer.getChildAt(i).isEnabled = false
+        }
 
-        // Initialize an image reader which will be used to capture still photos
-        Log.d(TAG, "Initializing image reader")
-        Log.d(TAG, CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP.toString())
-        val size = characteristics.get(
-            CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP
-        )!!
-            .getOutputSizes(args.pixelFormat).maxByOrNull { it.height * it.width }!!
-        imageReader = ImageReader.newInstance(
-            size.width, size.height, args.pixelFormat, IMAGE_BUFFER_SIZE
-        )
+        cameraJob = lifecycleScope.launch(Dispatchers.Main) {
+            // Release existing resources before opening a new camera
+            releaseResources()
+            
+            // Wait a bit for the system to settle
+            kotlinx.coroutines.delay(100)
 
-        // Creates list of Surfaces where the camera will output frames
-        val targets = listOf(fragmentCameraBinding.viewFinder.holder.surface, imageReader.surface)
+            try {
+                // Open the selected camera
+                camera = openCamera(cameraManager, currentCameraId, cameraHandler)
 
-        // Start a capture session using our open camera and list of Surfaces where frames will go
-        session = createCaptureSession(camera, targets, cameraHandler)
+                // Initialize an image reader which will be used to capture still photos
+                Log.d(TAG, "Initializing image reader")
+                val streamMap = characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+                    ?: throw RuntimeException("Camera $currentCameraId does not support stream configuration map")
+                
+                // Determine compatible format (fallback to JPEG if requested format not supported)
+                val supportedSizes = streamMap.getOutputSizes(args.pixelFormat)
+                val format = if (supportedSizes.isNullOrEmpty()) {
+                    Log.w(TAG, "Requested format ${args.pixelFormat} not supported by camera $currentCameraId, falling back to JPEG")
+                    ImageFormat.JPEG
+                } else {
+                    args.pixelFormat
+                }
+                
+                val finalSizes = if (format == args.pixelFormat) supportedSizes else streamMap.getOutputSizes(format)
+                val size = finalSizes?.maxByOrNull { it.height * it.width } 
+                    ?: throw RuntimeException("No supported sizes found for format $format on camera $currentCameraId")
+                
+                imageReader = ImageReader.newInstance(
+                    size.width, size.height, format, IMAGE_BUFFER_SIZE
+                )
 
-        val captureRequest = camera.createCaptureRequest(
-            CameraDevice.TEMPLATE_PREVIEW
-        ).apply { addTarget(fragmentCameraBinding.viewFinder.holder.surface) }
+                // Selects appropriate preview size and configures view finder
+                val captureRatio = size.width.toFloat() / size.height.toFloat()
+                val previewSize = getPreviewOutputSize(
+                    fragmentCameraBinding.viewFinder.display,
+                    characteristics,
+                    SurfaceHolder::class.java,
+                    aspectRatio = captureRatio
+                )
+                fragmentCameraBinding.viewFinder.setAspectRatio(
+                    previewSize.width,
+                    previewSize.height
+                )
 
-        // This will keep sending the capture request as frequently as possible until the
-        // session is torn down or session.stopRepeating() is called
-        session.setRepeatingRequest(captureRequest.build(), null, cameraHandler)
+                // Match the container to the camera aspect ratio to avoid black bars
+                // Check if we are in portrait or landscape relative to the sensor
+                val rotation = fragmentCameraBinding.viewFinder.display.rotation
+                val isLandscape = rotation == Surface.ROTATION_90 || rotation == Surface.ROTATION_270
+                
+                // Sensor orientation is usually 90 for back camera on phones
+                // But we just care about the output image aspect ratio vs the screen
+                val ratio = if (isLandscape) {
+                    "${previewSize.width}:${previewSize.height}"
+                } else {
+                    "${previewSize.height}:${previewSize.width}"
+                }
+                
+                Log.d(TAG, "Setting view_finder_container ratio to $ratio")
 
-        // Listen to the capture button
-        fragmentCameraBinding.captureButton.setOnClickListener {
+                val constraintSet = androidx.constraintlayout.widget.ConstraintSet()
+                constraintSet.clone(fragmentCameraBinding.root as androidx.constraintlayout.widget.ConstraintLayout)
+                constraintSet.setDimensionRatio(R.id.view_finder_container, ratio)
+                constraintSet.applyTo(fragmentCameraBinding.root as androidx.constraintlayout.widget.ConstraintLayout)
+            } catch (exc: Exception) {
+                Log.e(TAG, "Failed to initialize camera components", exc)
+                reEnableUI()
+                return@launch
+            }
 
-            // Disable click listener to prevent multiple requests simultaneously in flight
-            it.isEnabled = false
+            // Creates list of Surfaces where the camera will output frames
+            val targets = listOf(fragmentCameraBinding.viewFinder.holder.surface, imageReader.surface)
 
-            // Perform I/O heavy operations in a different scope
-            lifecycleScope.launch(Dispatchers.IO) {
-                takePhoto().use { result ->
-                    Log.d(TAG, "Result received: $result")
+            // Start a capture session using our open camera and list of Surfaces where frames will go
+            try {
+                session = createCaptureSession(camera, targets, cameraHandler)
+            } catch (exc: Exception) {
+                Log.e(TAG, "Failed to create capture session", exc)
+                reEnableUI()
+                return@launch
+            }
 
-                    // Save the result to disk
-                    val output = saveResult(result)
-                    Log.d(TAG, "Image saved: ${output.absolutePath}")
+            reEnableUI()
 
-                    // Display the photo taken to user
-                    lifecycleScope.launch(Dispatchers.Main) {
-                        navController.navigate(
-                            CameraFragmentDirections
-                                .actionCameraToJpegViewer(output.absolutePath)
-                                .setOrientation(result.orientation)
-                                .setDepth(
-                                    Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q &&
-                                            result.format == ImageFormat.DEPTH_JPEG
+            val captureRequest = camera.createCaptureRequest(
+                CameraDevice.TEMPLATE_PREVIEW
+            ).apply { 
+                addTarget(fragmentCameraBinding.viewFinder.holder.surface)
+                set(CaptureRequest.CONTROL_AE_MODE, flashMode)
+            }
+
+            // This will keep sending the capture request as frequently as possible until the
+            // session is torn down or session.stopRepeating() is called
+            session.setRepeatingRequest(captureRequest.build(), null, cameraHandler)
+
+            // Listen to the capture button
+            fragmentCameraBinding.captureButton.setOnClickListener {
+                val button = it
+                button.isEnabled = false
+
+                lifecycleScope.launch(Dispatchers.IO) {
+                    try {
+                        takePhoto().use { result ->
+                            Log.d(TAG, "Result received: $result")
+
+                            val output = saveResult(result)
+                            Log.d(TAG, "Image saved: ${output.absolutePath}")
+
+                            lifecycleScope.launch(Dispatchers.Main) {
+                                navController.navigate(
+                                    CameraFragmentDirections
+                                        .actionCameraToJpegViewer(output.absolutePath)
+                                        .setOrientation(result.orientation)
+                                        .setDepth(
+                                            Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q &&
+                                                    result.format == ImageFormat.DEPTH_JPEG
+                                        )
                                 )
-                        )
+                            }
+                        }
+                    } catch (exc: Exception) {
+                        Log.e(TAG, "Photo capture failed", exc)
+                        lifecycleScope.launch(Dispatchers.Main) {
+                            Toast.makeText(requireContext(), "Capture failed: ${exc.message}", Toast.LENGTH_SHORT).show()
+                            // Revert overlay if capture failed
+                            fragmentCameraBinding.overlay.background = null
+                        }
+                    } finally {
+                        lifecycleScope.launch(Dispatchers.Main) {
+                            button.isEnabled = true
+                        }
                     }
                 }
-
-                // Re-enable click listener after photo is taken
-                it.post { it.isEnabled = true }
             }
         }
     }
@@ -279,28 +662,32 @@ class CameraFragment : Fragment() {
         cameraId: String,
         handler: Handler? = null
     ): CameraDevice = suspendCancellableCoroutine { cont ->
-        manager.openCamera(cameraId, object : CameraDevice.StateCallback() {
-            override fun onOpened(device: CameraDevice) = cont.resume(device)
+        try {
+            manager.openCamera(cameraId, object : CameraDevice.StateCallback() {
+                override fun onOpened(device: CameraDevice) = cont.resume(device)
 
-            override fun onDisconnected(device: CameraDevice) {
-                Log.w(TAG, "Camera $cameraId has been disconnected")
-                requireActivity().finish()
-            }
-
-            override fun onError(device: CameraDevice, error: Int) {
-                val msg = when (error) {
-                    ERROR_CAMERA_DEVICE -> "Fatal (device)"
-                    ERROR_CAMERA_DISABLED -> "Device policy"
-                    ERROR_CAMERA_IN_USE -> "Camera in use"
-                    ERROR_CAMERA_SERVICE -> "Fatal (service)"
-                    ERROR_MAX_CAMERAS_IN_USE -> "Maximum cameras in use"
-                    else -> "Unknown"
+                override fun onDisconnected(device: CameraDevice) {
+                    Log.w(TAG, "Camera $cameraId has been disconnected")
+                    // Do not finish activity, just warn
                 }
-                val exc = RuntimeException("Camera $cameraId error: ($error) $msg")
-                Log.e(TAG, exc.message, exc)
-                if (cont.isActive) cont.resumeWithException(exc)
-            }
-        }, handler)
+
+                override fun onError(device: CameraDevice, error: Int) {
+                    val msg = when (error) {
+                        ERROR_CAMERA_DEVICE -> "Fatal (device)"
+                        ERROR_CAMERA_DISABLED -> "Device policy"
+                        ERROR_CAMERA_IN_USE -> "Camera in use"
+                        ERROR_CAMERA_SERVICE -> "Fatal (service)"
+                        ERROR_MAX_CAMERAS_IN_USE -> "Maximum cameras in use"
+                        else -> "Unknown"
+                    }
+                    val exc = RuntimeException("Camera $cameraId error: ($error) $msg")
+                    Log.e(TAG, exc.message, exc)
+                    if (cont.isActive) cont.resumeWithException(exc)
+                }
+            }, handler)
+        } catch (e: Exception) {
+             if (cont.isActive) cont.resumeWithException(e)
+        }
     }
 
     /**
@@ -350,7 +737,17 @@ class CameraFragment : Fragment() {
 
         val captureRequest = session.device.createCaptureRequest(
             CameraDevice.TEMPLATE_STILL_CAPTURE
-        ).apply { addTarget(imageReader.surface) }
+        ).apply { 
+            addTarget(imageReader.surface)
+            
+            // Set AE mode correctly for capture
+            set(CaptureRequest.CONTROL_AE_MODE, flashMode)
+            
+            // For some devices, we need to explicitly set FLASH_MODE when AE_MODE is ALWAYS_FLASH
+            if (flashMode == CaptureRequest.CONTROL_AE_MODE_ON_ALWAYS_FLASH) {
+                set(CaptureRequest.FLASH_MODE, CaptureRequest.FLASH_MODE_SINGLE)
+            }
+        }
         session.capture(captureRequest.build(), object : CameraCaptureSession.CaptureCallback() {
 
             override fun onCaptureStarted(
@@ -430,7 +827,7 @@ class CameraFragment : Fragment() {
             ImageFormat.RAW_SENSOR -> {
                 val dngCreator = DngCreator(characteristics, result.metadata)
                 try {
-                    if (args.convertToJpeg) {
+                    if (isJpeg) {
                         // Get RAW image data
                         val rawImage = result.image
                         val rawBuffer = rawImage.planes[0].buffer
@@ -571,6 +968,54 @@ class CameraFragment : Fragment() {
 
                 } catch (exc: IOException) {
                     Log.e(TAG, "Unable to write JPEG image to external storage", exc)
+                    cont.resumeWithException(exc)
+                }
+            }
+
+            // Handle JPEG format directly
+            ImageFormat.JPEG -> {
+                try {
+                    val image = result.image
+                    val buffer = image.planes[0].buffer
+                    val bytes = ByteArray(buffer.remaining())
+                    buffer.get(bytes)
+
+                    val filename = "IMG_${
+                        SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
+                    }.jpg"
+
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                        val contentValues = ContentValues().apply {
+                            put(MediaStore.MediaColumns.DISPLAY_NAME, filename)
+                            put(MediaStore.MediaColumns.MIME_TYPE, "image/jpeg")
+                            put(MediaStore.MediaColumns.RELATIVE_PATH, "${Environment.DIRECTORY_DCIM}/Camera")
+                        }
+                        val resolver = requireContext().contentResolver
+                        val uri = resolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, contentValues)
+                            ?: throw IOException("Failed to create MediaStore entry")
+
+                        resolver.openOutputStream(uri)?.use { it.write(bytes) }
+                        
+                        resolver.openFileDescriptor(uri, "rw")?.use { pfd ->
+                            ExifInterface(pfd.fileDescriptor).apply {
+                                setAttribute(ExifInterface.TAG_ORIENTATION, result.orientation.toString())
+                                saveAttributes()
+                            }
+                        }
+                        val dcim = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DCIM)
+                        cont.resume(File(File(dcim, "Camera"), filename))
+                    } else {
+                        val dcim = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DCIM)
+                        val file = File(File(dcim, "Camera").apply { if (!exists()) mkdirs() }, filename)
+                        FileOutputStream(file).use { it.write(bytes) }
+                        ExifInterface(file.absolutePath).apply {
+                            setAttribute(ExifInterface.TAG_ORIENTATION, result.orientation.toString())
+                            saveAttributes()
+                        }
+                        cont.resume(file)
+                    }
+                } catch (exc: IOException) {
+                    Log.e(TAG, "Unable to write JPEG image", exc)
                     cont.resumeWithException(exc)
                 }
             }

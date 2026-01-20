@@ -51,7 +51,8 @@ fun <T>getPreviewOutputSize(
         display: Display,
         characteristics: CameraCharacteristics,
         targetClass: Class<T>,
-        format: Int? = null
+        format: Int? = null,
+        aspectRatio: Float? = null
 ): Size {
 
     // Find which is smaller: screen or 1080p
@@ -59,21 +60,30 @@ fun <T>getPreviewOutputSize(
     val hdScreen = screenSize.long >= SIZE_1080P.long || screenSize.short >= SIZE_1080P.short
     val maxSize = if (hdScreen) SIZE_1080P else screenSize
 
-    // If image format is provided, use it to determine supported sizes; else use target class
-    val config = characteristics.get(
-            CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)!!
-    if (format == null)
-        assert(StreamConfigurationMap.isOutputSupportedFor(targetClass))
-    else
-        assert(config.isOutputSupportedFor(format))
-    val allSizes = if (format == null)
-        config.getOutputSizes(targetClass) else config.getOutputSizes(format)
+    // If format is provided, use it; else use target class
+    val streamMap = characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)!!
+    val allSizes = if (format == null) {
+        streamMap.getOutputSizes(targetClass)
+    } else {
+        streamMap.getOutputSizes(format)
+    }
+
+    // Filter by aspect ratio if requested
+    val filteredSizes = if (aspectRatio != null) {
+        allSizes.filter { 
+            val ratio = it.width.toFloat() / it.height.toFloat()
+            Math.abs(ratio - aspectRatio) < 0.01f || Math.abs((1f/ratio) - aspectRatio) < 0.01f
+        }.ifEmpty { allSizes.toList() }
+    } else {
+        allSizes.toList()
+    }
 
     // Get available sizes and sort them by area from largest to smallest
-    val validSizes = allSizes
+    val validSizes = filteredSizes
             .sortedWith(compareBy { it.height * it.width })
             .map { SmartSize(it.width, it.height) }.reversed()
 
     // Then, get the largest output size that is smaller or equal than our max size
-    return validSizes.first { it.long <= maxSize.long && it.short <= maxSize.short }.size
+    return validSizes.firstOrNull { it.long <= maxSize.long && it.short <= maxSize.short }?.size 
+        ?: validSizes.last().size
 }

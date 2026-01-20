@@ -41,6 +41,7 @@
             android:name="com.reilandeubank.unprocess.CameraActivity"
             android:clearTaskOnLaunch="true"
             android:exported="true"
+            android:screenOrientation="portrait"
             android:theme="@style/AppTheme">
 
             <!-- Main app intent filter -->

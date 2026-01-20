@@ -19,6 +19,9 @@ package com.reilandeubank.unprocess.fragments
 import android.Manifest
 import android.content.Context
 import android.content.pm.PackageManager
+import android.hardware.camera2.CameraCharacteristics
+import android.hardware.camera2.CameraManager
+import android.hardware.camera2.CameraMetadata
 import android.os.Bundle
 import android.widget.Toast
 import androidx.core.content.ContextCompat
@@ -40,7 +43,7 @@ class PermissionsFragment : Fragment() {
 
         if (hasPermissions(requireContext())) {
             // If permissions have already been granted, proceed
-            nativateToCamera();
+            navigateToCamera()
         } else {
             // Request camera-related permissions
             requestPermissions(PERMISSIONS_REQUIRED, PERMISSIONS_REQUEST_CODE)
@@ -53,18 +56,29 @@ class PermissionsFragment : Fragment() {
         if (requestCode == PERMISSIONS_REQUEST_CODE) {
             if (grantResults[0] == PackageManager.PERMISSION_GRANTED) {
                 // Takes the user to the success fragment when permission is granted
-                nativateToCamera();
+                navigateToCamera()
             } else {
                 Toast.makeText(context, "Permission request denied", Toast.LENGTH_LONG).show()
             }
         }
     }
 
-    private fun nativateToCamera()
-    {
+    private fun navigateToCamera() {
         lifecycleScope.launchWhenStarted {
+            val cameraManager = requireContext().getSystemService(Context.CAMERA_SERVICE) as CameraManager
+            val cameraId = cameraManager.cameraIdList.firstOrNull { id ->
+                val characteristics = cameraManager.getCameraCharacteristics(id)
+                val capabilities = characteristics.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES)
+                capabilities?.contains(CameraMetadata.REQUEST_AVAILABLE_CAPABILITIES_RAW) ?: false
+            } ?: cameraManager.cameraIdList.getOrNull(0) ?: "0"
+
             Navigation.findNavController(requireActivity(), R.id.fragment_container).navigate(
-                    PermissionsFragmentDirections.actionPermissionsToSelector())
+                PermissionsFragmentDirections.actionPermissionsToCamera(
+                    cameraId,
+                    android.graphics.ImageFormat.RAW_SENSOR,
+                    true
+                )
+            )
         }
     }
 
