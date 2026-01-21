@@ -77,9 +77,9 @@ class OrientationLiveData(
 
             val deviceOrientationDegrees = when (surfaceRotation) {
                 Surface.ROTATION_0 -> 0
-                Surface.ROTATION_90 -> 90
+                Surface.ROTATION_90 -> 270
                 Surface.ROTATION_180 -> 180
-                Surface.ROTATION_270 -> 270
+                Surface.ROTATION_270 -> 90
                 else -> 0
             }
 
