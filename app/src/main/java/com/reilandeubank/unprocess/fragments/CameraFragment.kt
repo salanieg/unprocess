@@ -37,7 +37,6 @@ import android.os.Handler
 import android.os.HandlerThread
 import android.widget.Toast
 import android.util.Log
-import android.view.HapticFeedbackConstants
 import android.view.LayoutInflater
 import android.view.Surface
 import android.view.SurfaceHolder
@@ -306,9 +305,14 @@ class CameraFragment : Fragment() {
         val openableIds: Set<String> = cameraIdList.toSet()
         Log.d(TAG, "Lens selector — cameras found: ${cameraIdList.joinToString()}")
 
-        // Expand logical cameras (both BACK and FRONT) into their physical children where possible,
-        // so the user gets a button for each physical lens and its associated zoom level.
-        // If a physical camera cannot be opened directly, fall back to the logical camera ID.
+        // Expand logical BACK cameras into their physical children where
+        // possible (so the user gets per-focal-length buttons on multi-lens
+        // back setups). Falls back to the logical ID if none of the physical
+        // children can be opened directly.
+        //
+        // FRONT cameras are intentionally NOT expanded — opening a physical
+        // sub-camera of a logical front camera (e.g. on Pixel) bypasses the
+        // system's tuned preview pipeline. The physical child's
         // SENSOR_ORIENTATION / active-array often differs from the logical
         // wrapper, which makes our rotation/aspect-ratio math wrong and shows
         // up as a squished selfie preview. The logical camera always works.
@@ -317,7 +321,7 @@ class CameraFragment : Fragment() {
             val ch = cameraManager.getCameraCharacteristics(id)
             val isFront = ch.get(CameraCharacteristics.LENS_FACING) ==
                     CameraCharacteristics.LENS_FACING_FRONT
-            val physicalIds = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            val physicalIds = if (!isFront && Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
                 ch.physicalCameraIds
             } else emptySet()
             val openablePhysicals = physicalIds.filter { it in openableIds }
@@ -331,6 +335,9 @@ class CameraFragment : Fragment() {
         // unconditionally (we never expanded them).
         val filteredIds = expandedIds.filter { id ->
             val ch = cameraManager.getCameraCharacteristics(id)
+            val isFront = ch.get(CameraCharacteristics.LENS_FACING) ==
+                    CameraCharacteristics.LENS_FACING_FRONT
+            if (isFront) return@filter true
             val children = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
                 ch.physicalCameraIds
             } else emptySet()
@@ -348,7 +355,7 @@ class CameraFragment : Fragment() {
             }
             .sortedBy { it.second }
             .map { (id, focal, facing) ->
-                val base = labelForFocalLength(focal, id)
+                val base = if (facing == CameraCharacteristics.LENS_FACING_FRONT) "F" else labelForFocalLength(focal, id)
                 val label = if (usedLabels.add(base)) base else "$base ($id)".also { usedLabels.add(it) }
                 LensEntry(id, focal, label)
             }
@@ -777,20 +784,7 @@ class CameraFragment : Fragment() {
      *   demosaic finished  → spinner + "Speichere JPEG…"  /  "Speichere RAW (DNG)…"
      *   write done         → ✓ "Gespeichert" (briefly)
      */
-
-    /**
-     * Public method to trigger a capture programmatically (e.g., via volume keys).
-     * Performs click on the capture button and provides haptic feedback.
-     */
-    fun triggerCapture() {
-        fragmentCameraBinding?.captureButton?.let { button ->
-            // Provide haptic feedback for the shutter action.
-            button.performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY)
-            // Simulate button click.
-            button.performClick()
-        }
-    }
-
+    private fun handleCaptureClick(button: View) {
         if (!::session.isInitialized) return
         // Disable while the save is in flight. Once the Done state lands,
         // the button is re-enabled and rebadged as "Take new" by
