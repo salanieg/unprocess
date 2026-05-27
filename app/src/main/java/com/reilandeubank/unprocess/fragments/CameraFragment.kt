@@ -159,11 +159,7 @@ class CameraFragment : Fragment() {
     private var flashMode: Int = CaptureRequest.CONTROL_AE_MODE_ON
     private var isSquare: Boolean = false
 
-    private val prefs by lazy { requireContext().getSharedPreferences("purecam_settings", Context.MODE_PRIVATE) }
     private var isSettingsMode = false
-    private var isAspectEnabled = true
-    private var isFlashEnabled = true
-    private var isFormatEnabled = true
 
     private val physicalToLogicalMap = HashMap<String, String>()
 
@@ -182,11 +178,6 @@ class CameraFragment : Fragment() {
         currentCameraId = args.cameraId
         isJpeg = args.convertToJpeg
 
-        // Load toolbar settings configuration
-        isAspectEnabled = prefs.getBoolean("aspect_enabled", true)
-        isFlashEnabled = prefs.getBoolean("flash_enabled", true)
-        isFormatEnabled = prefs.getBoolean("format_enabled", true)
-
         updateViewfinderRatio()
         updateModeToggleUI()
         updateFlashUI()
@@ -195,59 +186,47 @@ class CameraFragment : Fragment() {
         setupLensSelector()
 
         fragmentCameraBinding.modeToggle?.setOnClickListener {
-            if (isSettingsMode) {
-                isFormatEnabled = !isFormatEnabled
-                updateSettingsUI()
-            } else {
-                isJpeg = !isJpeg
-                updateModeToggleUI()
-                // The capture format is always RAW_SENSOR — only the save path
-                // differs (DNG vs DNG→Bitmap→JPEG). No need to restart the session.
-            }
+            isJpeg = !isJpeg
+            updateModeToggleUI()
+            updateSettingsUI()
+            // The capture format is always RAW_SENSOR — only the save path
+            // differs (DNG vs DNG→Bitmap→JPEG). No need to restart the session.
         }
 
         fragmentCameraBinding.aspectRatioToggle?.setOnClickListener {
-            if (isSettingsMode) {
-                isAspectEnabled = !isAspectEnabled
-                updateSettingsUI()
-            } else {
-                isSquare = !isSquare
-                updateAspectRatioUI()
-                updateViewfinderRatio()
-                if (!isShowingDone) {
-                    initializeCamera()
-                }
+            isSquare = !isSquare
+            updateAspectRatioUI()
+            updateViewfinderRatio()
+            updateSettingsUI()
+            if (!isShowingDone) {
+                initializeCamera()
             }
         }
 
         fragmentCameraBinding.flashToggle?.setOnClickListener {
-            if (isSettingsMode) {
-                isFlashEnabled = !isFlashEnabled
-                updateSettingsUI()
+            flashMode = if (flashMode == CaptureRequest.CONTROL_AE_MODE_ON_ALWAYS_FLASH) {
+                CaptureRequest.CONTROL_AE_MODE_ON
             } else {
-                flashMode = if (flashMode == CaptureRequest.CONTROL_AE_MODE_ON_ALWAYS_FLASH) {
-                    CaptureRequest.CONTROL_AE_MODE_ON
+                CaptureRequest.CONTROL_AE_MODE_ON_ALWAYS_FLASH
+            }
+            updateFlashUI()
+            updateSettingsUI()
+            
+            // Try to update the existing session if possible
+            try {
+                if (::session.isInitialized) {
+                        val captureRequest = camera.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
+                            addTarget(fragmentCameraBinding.viewFinder.holder.surface)
+                            set(CaptureRequest.CONTROL_AE_MODE, flashMode)
+                            // We don't use TORCH for standard flash toggle, common camera apps use strobe
+                        }
+                    session.setRepeatingRequest(captureRequest.build(), null, cameraHandler)
                 } else {
-                    CaptureRequest.CONTROL_AE_MODE_ON_ALWAYS_FLASH
-                }
-                updateFlashUI()
-                
-                // Try to update the existing session if possible
-                try {
-                    if (::session.isInitialized) {
-                            val captureRequest = camera.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
-                                addTarget(fragmentCameraBinding.viewFinder.holder.surface)
-                                set(CaptureRequest.CONTROL_AE_MODE, flashMode)
-                                // We don't use TORCH for standard flash toggle, common camera apps use strobe
-                            }
-                        session.setRepeatingRequest(captureRequest.build(), null, cameraHandler)
-                    } else {
-                        initializeCamera()
-                    }
-                } catch (exc: Exception) {
-                    Log.e(TAG, "Failed to update flash mode on existing session, re-initializing", exc)
                     initializeCamera()
                 }
+            } catch (exc: Exception) {
+                Log.e(TAG, "Failed to update flash mode on existing session, re-initializing", exc)
+                initializeCamera()
             }
         }
 
@@ -416,21 +395,24 @@ class CameraFragment : Fragment() {
         val entries = sortedEntries.map { (id, focal, facing) ->
             val ch = cameraManager.getCameraCharacteristics(id)
             val mainIdForFacing = if (facing == CameraCharacteristics.LENS_FACING_FRONT) "1" else "0"
-            val (mainFocal, mainActiveWidth) = try {
+            val (mainFocal, mainSensorWidth) = try {
                 val mainCh = cameraManager.getCameraCharacteristics(mainIdForFacing)
                 val f = mainCh.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)?.firstOrNull() ?: 4.3f
+                val physicalSize = mainCh.get(CameraCharacteristics.SENSOR_INFO_PHYSICAL_SIZE)
                 val activeRect = mainCh.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)
-                val width = activeRect?.width()?.toFloat() ?: 1f
+                val width = physicalSize?.width ?: activeRect?.width()?.toFloat() ?: 1f
                 Pair(f, width)
             } catch (e: Exception) {
                 Pair(4.3f, 1f)
             }
 
-            val currentActiveWidth = ch.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)?.width()?.toFloat() ?: 1f
+            val currentSensorWidth = ch.get(CameraCharacteristics.SENSOR_INFO_PHYSICAL_SIZE)?.width
+                ?: ch.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)?.width()?.toFloat()
+                ?: 1f
             
             // Calculate total effective zoom (optical * digital sensor crop)
             val opticalZoom = if (focal > 0f && mainFocal > 0f) focal / mainFocal else 1f
-            val cropZoom = if (mainActiveWidth > 1f && currentActiveWidth > 1f) mainActiveWidth / currentActiveWidth else 1f
+            val cropZoom = if (mainSensorWidth > 0f && currentSensorWidth > 0f) mainSensorWidth / currentSensorWidth else 1f
             val effectiveZoom = opticalZoom * cropZoom
 
             val base = if (facing == CameraCharacteristics.LENS_FACING_FRONT) {
@@ -504,15 +486,6 @@ class CameraFragment : Fragment() {
 
     private fun toggleSettingsMode() {
         isSettingsMode = !isSettingsMode
-        if (!isSettingsMode) {
-            // Save state when exiting settings mode
-            prefs.edit().apply {
-                putBoolean("aspect_enabled", isAspectEnabled)
-                putBoolean("flash_enabled", isFlashEnabled)
-                putBoolean("format_enabled", isFormatEnabled)
-                apply()
-            }
-        }
         updateSettingsUI()
     }
 
@@ -526,30 +499,22 @@ class CameraFragment : Fragment() {
         // and grayed out (inactive) when settings mode is ON (active)
         binding.settingsToggle?.let { setButtonActiveStyle(it, !isSettingsMode) }
         
-        if (isSettingsMode) {
-            // Show all buttons inside settings mode
-            binding.aspectRatioToggle?.visibility = View.VISIBLE
-            binding.flashToggle?.visibility = View.VISIBLE
-            binding.modeToggle?.visibility = View.VISIBLE
-            
-            setButtonActiveStyle(binding.aspectRatioToggle, isAspectEnabled)
-            setButtonActiveStyle(binding.flashToggle, isFlashEnabled)
-            setButtonActiveStyle(binding.modeToggle, isFormatEnabled)
-        } else {
-            // Only show enabled buttons
-            binding.aspectRatioToggle?.visibility = if (isAspectEnabled) View.VISIBLE else View.GONE
-            binding.flashToggle?.visibility = if (isFlashEnabled) View.VISIBLE else View.GONE
-            binding.modeToggle?.visibility = if (isFormatEnabled) View.VISIBLE else View.GONE
-            
-            // Highlight visible buttons with active accent color
-            setButtonActiveStyle(binding.aspectRatioToggle, isAspectEnabled)
-            setButtonActiveStyle(binding.flashToggle, isFlashEnabled)
-            setButtonActiveStyle(binding.modeToggle, isFormatEnabled)
-            
-            updateAspectRatioUI()
-            updateFlashUI()
-            updateModeToggleUI()
-        }
+        // Flash toggle is always visible and always active
+        binding.flashToggle?.visibility = View.VISIBLE
+        setButtonActiveStyle(binding.flashToggle, true)
+        
+        // Aspect ratio and format/mode toggles are shown only in settings mode,
+        // and they are always active when visible.
+        val settingsVisibility = if (isSettingsMode) View.VISIBLE else View.GONE
+        binding.aspectRatioToggle?.visibility = settingsVisibility
+        binding.modeToggle?.visibility = settingsVisibility
+        
+        setButtonActiveStyle(binding.aspectRatioToggle, true)
+        setButtonActiveStyle(binding.modeToggle, true)
+        
+        updateAspectRatioUI()
+        updateFlashUI()
+        updateModeToggleUI()
     }
 
     private fun setButtonActiveStyle(button: com.google.android.material.button.MaterialButton?, active: Boolean) {
@@ -849,13 +814,14 @@ class CameraFragment : Fragment() {
         }
 
         cameraJob = lifecycleScope.launch(Dispatchers.Main) {
-            // Release existing resources before opening a new camera
-            releaseResources()
-            
-            // Wait a bit for the system to settle
-            kotlinx.coroutines.delay(100)
-
+            var initialized = false
             try {
+                // Release existing resources before opening a new camera
+                releaseResources()
+                
+                // Wait a bit for the system to settle
+                kotlinx.coroutines.delay(250)
+
                 // Open the logical camera parent (or the camera itself if it is logical)
                 val cameraToOpen = physicalToLogicalMap[currentCameraId] ?: currentCameraId
                 try {
@@ -941,49 +907,46 @@ class CameraFragment : Fragment() {
                 constraintSet.clone(fragmentCameraBinding.root as androidx.constraintlayout.widget.ConstraintLayout)
                 constraintSet.setDimensionRatio(R.id.view_finder_container, ratio)
                 constraintSet.applyTo(fragmentCameraBinding.root as androidx.constraintlayout.widget.ConstraintLayout)
+
+                // Creates list of Surfaces where the camera will output frames
+                val targets = listOf(fragmentCameraBinding.viewFinder.holder.surface, imageReader.surface)
+
+                // Creates list of OutputConfigurations where the camera will output frames
+                val outputs = targets.map { surface ->
+                    val config = android.hardware.camera2.params.OutputConfiguration(surface)
+                    val logicalParent = physicalToLogicalMap[currentCameraId]
+                    if (logicalParent != null && logicalParent != currentCameraId) {
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                            config.setPhysicalCameraId(currentCameraId)
+                        }
+                    }
+                    config
+                }
+
+                // Start a capture session using our open camera and list of OutputConfigurations
+                session = createCaptureSession(camera, outputs, cameraHandler)
+
+                val captureRequest = camera.createCaptureRequest(
+                    CameraDevice.TEMPLATE_PREVIEW
+                ).apply { 
+                    addTarget(fragmentCameraBinding.viewFinder.holder.surface)
+                    set(CaptureRequest.CONTROL_AE_MODE, flashMode)
+                }
+
+                // This will keep sending the capture request as frequently as possible until the
+                // session is torn down or session.stopRepeating() is called
+                session.setRepeatingRequest(captureRequest.build(), null, cameraHandler)
+
+                initialized = true
             } catch (exc: Exception) {
                 Log.e(TAG, "Failed to initialize camera components", exc)
-                reEnableUI()
-                return@launch
-            }
-
-            // Creates list of Surfaces where the camera will output frames
-            val targets = listOf(fragmentCameraBinding.viewFinder.holder.surface, imageReader.surface)
-
-            // Creates list of OutputConfigurations where the camera will output frames
-            val outputs = targets.map { surface ->
-                val config = android.hardware.camera2.params.OutputConfiguration(surface)
-                val logicalParent = physicalToLogicalMap[currentCameraId]
-                if (logicalParent != null && logicalParent != currentCameraId) {
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-                        config.setPhysicalCameraId(currentCameraId)
-                    }
+            } finally {
+                if (!initialized) {
+                    Log.d(TAG, "Camera initialization failed or cancelled, releasing resources")
+                    releaseResources()
                 }
-                config
-            }
-
-            // Start a capture session using our open camera and list of OutputConfigurations
-            try {
-                session = createCaptureSession(camera, outputs, cameraHandler)
-            } catch (exc: Exception) {
-                Log.e(TAG, "Failed to create capture session", exc)
                 reEnableUI()
-                return@launch
             }
-
-            reEnableUI()
-
-            val captureRequest = camera.createCaptureRequest(
-                CameraDevice.TEMPLATE_PREVIEW
-            ).apply { 
-                addTarget(fragmentCameraBinding.viewFinder.holder.surface)
-                set(CaptureRequest.CONTROL_AE_MODE, flashMode)
-            }
-
-            // This will keep sending the capture request as frequently as possible until the
-            // session is torn down or session.stopRepeating() is called
-            session.setRepeatingRequest(captureRequest.build(), null, cameraHandler)
-
         }
     }
 

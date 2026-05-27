@@ -35,20 +35,6 @@
         app:layout_constraintEnd_toEndOf="parent">
 
         <com.google.android.material.button.MaterialButton
-            android:id="@+id/aspect_ratio_toggle"
-            style="@style/Widget.Material3.Button.TonalButton"
-            android:layout_width="wrap_content"
-            android:layout_height="48dp"
-            android:layout_marginEnd="8dp"
-            android:text="@string/aspect_ratio_full"
-            android:insetTop="0dp"
-            android:insetBottom="0dp"
-            android:insetLeft="0dp"
-            android:insetRight="0dp"
-            android:minWidth="0dp"
-            android:minHeight="0dp" />
-
-        <com.google.android.material.button.MaterialButton
             android:id="@+id/flash_toggle"
             style="@style/Widget.Material3.Button.TonalButton"
             android:layout_width="48dp"
@@ -64,6 +50,20 @@
             app:iconGravity="textStart"
             app:iconPadding="0dp"
             app:shapeAppearanceOverlay="@style/ShapeAppearance.Material3.Corner.Full" />
+
+        <com.google.android.material.button.MaterialButton
+            android:id="@+id/aspect_ratio_toggle"
+            style="@style/Widget.Material3.Button.TonalButton"
+            android:layout_width="wrap_content"
+            android:layout_height="48dp"
+            android:layout_marginEnd="8dp"
+            android:text="@string/aspect_ratio_full"
+            android:insetTop="0dp"
+            android:insetBottom="0dp"
+            android:insetLeft="0dp"
+            android:insetRight="0dp"
+            android:minWidth="0dp"
+            android:minHeight="0dp" />
 
         <com.google.android.material.button.MaterialButton
             android:id="@+id/mode_toggle"
