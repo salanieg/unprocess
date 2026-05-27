@@ -37,6 +37,7 @@ import android.os.Handler
 import android.os.HandlerThread
 import android.widget.Toast
 import android.util.Log
+import android.view.HapticFeedbackConstants
 import android.view.LayoutInflater
 import android.view.Surface
 import android.view.SurfaceHolder
@@ -149,6 +150,7 @@ class CameraFragment : Fragment() {
     private var currentCameraId: String = ""
     private var isJpeg: Boolean = false
     private var flashMode: Int = CaptureRequest.CONTROL_AE_MODE_ON
+    private var isSquare: Boolean = false
 
     override fun onCreateView(
         inflater: LayoutInflater,
@@ -166,6 +168,7 @@ class CameraFragment : Fragment() {
         isJpeg = args.convertToJpeg
         updateModeToggleUI()
         updateFlashUI()
+        updateAspectRatioUI()
         setupLensSelector()
 
         fragmentCameraBinding.modeToggle?.setOnClickListener {
@@ -173,6 +176,14 @@ class CameraFragment : Fragment() {
             updateModeToggleUI()
             // The capture format is always RAW_SENSOR — only the save path
             // differs (DNG vs DNG→Bitmap→JPEG). No need to restart the session.
+        }
+
+        fragmentCameraBinding.aspectRatioToggle?.setOnClickListener {
+            isSquare = !isSquare
+            updateAspectRatioUI()
+            if (!isShowingDone) {
+                initializeCamera()
+            }
         }
 
         fragmentCameraBinding.flashToggle?.setOnClickListener {
@@ -240,8 +251,12 @@ class CameraFragment : Fragment() {
                 height: Int
             ) = Unit
             override fun surfaceCreated(holder: SurfaceHolder) {
-                // To ensure that size is set, initialize camera in the view's thread
-                view.post { initializeCamera() }
+                // To ensure that size is set, initialize camera in the view's thread if not reviewing
+                view.post {
+                    if (!isShowingDone) {
+                        initializeCamera()
+                    }
+                }
             }
         })
 
@@ -269,6 +284,12 @@ class CameraFragment : Fragment() {
         fragmentCameraBinding.flashToggle?.setIconResource(iconRes)
     }
 
+    private fun updateAspectRatioUI() {
+        fragmentCameraBinding.aspectRatioToggle?.text = getString(
+            if (isSquare) R.string.aspect_ratio_square else R.string.aspect_ratio_full
+        )
+    }
+
     private var allCameraIds: List<String> = emptyList()
 
     private data class LensEntry(
@@ -285,14 +306,9 @@ class CameraFragment : Fragment() {
         val openableIds: Set<String> = cameraIdList.toSet()
         Log.d(TAG, "Lens selector — cameras found: ${cameraIdList.joinToString()}")
 
-        // Expand logical BACK cameras into their physical children where
-        // possible (so the user gets per-focal-length buttons on multi-lens
-        // back setups). Falls back to the logical ID if none of the physical
-        // children can be opened directly.
-        //
-        // FRONT cameras are intentionally NOT expanded — opening a physical
-        // sub-camera of a logical front camera (e.g. on Pixel) bypasses the
-        // system's tuned preview pipeline. The physical child's
+        // Expand logical cameras (both BACK and FRONT) into their physical children where possible,
+        // so the user gets a button for each physical lens and its associated zoom level.
+        // If a physical camera cannot be opened directly, fall back to the logical camera ID.
         // SENSOR_ORIENTATION / active-array often differs from the logical
         // wrapper, which makes our rotation/aspect-ratio math wrong and shows
         // up as a squished selfie preview. The logical camera always works.
@@ -301,7 +317,7 @@ class CameraFragment : Fragment() {
             val ch = cameraManager.getCameraCharacteristics(id)
             val isFront = ch.get(CameraCharacteristics.LENS_FACING) ==
                     CameraCharacteristics.LENS_FACING_FRONT
-            val physicalIds = if (!isFront && Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            val physicalIds = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
                 ch.physicalCameraIds
             } else emptySet()
             val openablePhysicals = physicalIds.filter { it in openableIds }
@@ -315,9 +331,6 @@ class CameraFragment : Fragment() {
         // unconditionally (we never expanded them).
         val filteredIds = expandedIds.filter { id ->
             val ch = cameraManager.getCameraCharacteristics(id)
-            val isFront = ch.get(CameraCharacteristics.LENS_FACING) ==
-                    CameraCharacteristics.LENS_FACING_FRONT
-            if (isFront) return@filter true
             val children = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
                 ch.physicalCameraIds
             } else emptySet()
@@ -335,7 +348,7 @@ class CameraFragment : Fragment() {
             }
             .sortedBy { it.second }
             .map { (id, focal, facing) ->
-                val base = if (facing == CameraCharacteristics.LENS_FACING_FRONT) "F" else labelForFocalLength(focal, id)
+                val base = labelForFocalLength(focal, id)
                 val label = if (usedLabels.add(base)) base else "$base ($id)".also { usedLabels.add(it) }
                 LensEntry(id, focal, label)
             }
@@ -420,6 +433,9 @@ class CameraFragment : Fragment() {
         val overlay = binding.captureProgressOverlay ?: return
         val thumbnail = binding.captureProgressThumbnail ?: return
 
+        // Hide lens selector card during progress/review
+        binding.lensSelectorCard?.visibility = View.GONE
+
         when (state) {
             is CaptureProgress.Saving -> {
                 // Dim the preview, no thumbnail yet, no spinner, no text.
@@ -439,6 +455,13 @@ class CameraFragment : Fragment() {
                 if (state.thumbnail != null) {
                     thumbnail.setImageBitmap(state.thumbnail)
                     thumbnail.visibility = View.VISIBLE
+                    
+                    // Adjust viewfinder container ratio to match the captured thumbnail aspect ratio
+                    val ratio = "${state.thumbnail.width}:${state.thumbnail.height}"
+                    val constraintSet = androidx.constraintlayout.widget.ConstraintSet()
+                    constraintSet.clone(binding.root as androidx.constraintlayout.widget.ConstraintLayout)
+                    constraintSet.setDimensionRatio(R.id.view_finder_container, ratio)
+                    constraintSet.applyTo(binding.root as androidx.constraintlayout.widget.ConstraintLayout)
                 } else {
                     // Decoder failed (typical for DNG-only on some devices).
                     // Keep the dim — there's just no preview image to show.
@@ -464,6 +487,12 @@ class CameraFragment : Fragment() {
         val binding = _fragmentCameraBinding ?: return
         val overlay = binding.captureProgressOverlay ?: return
         val thumbnail = binding.captureProgressThumbnail ?: return
+
+        // Restore lens selector card visibility if camera entries exist
+        if (allCameraIds.isNotEmpty()) {
+            binding.lensSelectorCard?.visibility = View.VISIBLE
+        }
+
         overlay.animate().cancel()
         overlay.visibility = View.GONE
         overlay.alpha = 1f
@@ -473,6 +502,9 @@ class CameraFragment : Fragment() {
         doneThumbnail = null
         isShowingDone = false
         updateCaptureButtonForState()
+        
+        // Restore/start camera feed preview
+        initializeCamera()
     }
 
     /** Toggles the capture button label between "Capture" and "Take new"
@@ -545,8 +577,10 @@ class CameraFragment : Fragment() {
         // Update highlight immediately for responsive feel
         updateLensHighlight()
         
-        // Cancel any pending camera operations and start fresh
-        initializeCamera()
+        // Cancel any pending camera operations and start fresh only if not showing done preview
+        if (!isShowingDone) {
+            initializeCamera()
+        }
     }
 
     private fun openRecentPhoto() {
@@ -690,7 +724,7 @@ class CameraFragment : Fragment() {
                 fragmentCameraBinding.viewFinder.setAspectRatio(displayWidth, displayHeight)
                 fragmentCameraBinding.viewFinder.setBufferSize(previewSize.width, previewSize.height)
 
-                val ratio = "$displayWidth:$displayHeight"
+                val ratio = if (isSquare) "1:1" else "$displayWidth:$displayHeight"
                 val facingFrontPreview = characteristics.get(CameraCharacteristics.LENS_FACING) ==
                         CameraCharacteristics.LENS_FACING_FRONT
                 Log.d(TAG, "PREVIEW DIAG | camera=$currentCameraId facing=${if (facingFrontPreview) "FRONT" else "BACK"} sensor=${sensorOrientation}° deviceDisplay=${deviceRotation}° swap=$needsSwap | buffer=${previewSize.width}x${previewSize.height} viewAspect=$displayWidth:$displayHeight container=$ratio")
@@ -743,7 +777,20 @@ class CameraFragment : Fragment() {
      *   demosaic finished  → spinner + "Speichere JPEG…"  /  "Speichere RAW (DNG)…"
      *   write done         → ✓ "Gespeichert" (briefly)
      */
-    private fun handleCaptureClick(button: View) {
+
+    /**
+     * Public method to trigger a capture programmatically (e.g., via volume keys).
+     * Performs click on the capture button and provides haptic feedback.
+     */
+    fun triggerCapture() {
+        fragmentCameraBinding?.captureButton?.let { button ->
+            // Provide haptic feedback for the shutter action.
+            button.performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY)
+            // Simulate button click.
+            button.performClick()
+        }
+    }
+
         if (!::session.isInitialized) return
         // Disable while the save is in flight. Once the Done state lands,
         // the button is re-enabled and rebadged as "Take new" by
@@ -764,9 +811,16 @@ class CameraFragment : Fragment() {
                         result.format == ImageFormat.RAW_SENSOR && isJpeg -> {
                             val bitmap = withContext(Dispatchers.IO) { rawToBitmap(result) }
                             try {
-                                val file = withContext(Dispatchers.IO) { writeBitmapAsJpeg(bitmap) }
-                                val thumb = withContext(Dispatchers.Default) { makeThumbnail(bitmap) }
-                                SaveOutput(file, thumb)
+                                val finalBitmap = if (isSquare) cropToSquare(bitmap) else bitmap
+                                try {
+                                    val file = withContext(Dispatchers.IO) { writeBitmapAsJpeg(finalBitmap) }
+                                    val thumb = withContext(Dispatchers.Default) { makeThumbnail(finalBitmap) }
+                                    SaveOutput(file, thumb)
+                                } finally {
+                                    if (finalBitmap !== bitmap) {
+                                        finalBitmap.recycle()
+                                    }
+                                }
                             } finally {
                                 bitmap.recycle()
                             }
@@ -1027,6 +1081,15 @@ class CameraFragment : Fragment() {
         return Bitmap.createScaledBitmap(source, w, h, true)
     }
 
+    private fun cropToSquare(bitmap: Bitmap): Bitmap {
+        val width = bitmap.width
+        val height = bitmap.height
+        val minDim = minOf(width, height)
+        val x = (width - minDim) / 2
+        val y = (height - minDim) / 2
+        return Bitmap.createBitmap(bitmap, x, y, minDim, minDim)
+    }
+
     /**
      * Demosaics the RAW sensor data into a Bitmap by writing a temporary DNG
      * and letting the platform's RAW decoder process it. The output is rotated
@@ -1146,8 +1209,10 @@ class CameraFragment : Fragment() {
                             decoded, 0, 0, decoded.width, decoded.height, matrix, true,
                         ).also { r -> if (r !== decoded) decoded.recycle() }
                     } else decoded
-                    val small = makeThumbnail(rotated)
-                    if (small !== rotated) rotated.recycle()
+                    val finalBitmap = if (isSquare) cropToSquare(rotated) else rotated
+                    val small = makeThumbnail(finalBitmap)
+                    if (small !== finalBitmap) finalBitmap.recycle()
+                    if (finalBitmap !== rotated) rotated.recycle()
                     small
                 }
             } catch (exc: Exception) {
@@ -1171,6 +1236,20 @@ class CameraFragment : Fragment() {
         val buffer = image.planes[0].buffer
         val bytes = ByteArray(buffer.remaining())
         buffer.get(bytes)
+
+        if (isSquare) {
+            val decoded = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+                ?: throw IOException("Failed to decode JPEG bytes for cropping")
+            val cropped = cropToSquare(decoded)
+            try {
+                val file = writeBitmapAsJpeg(cropped)
+                val thumb = makeThumbnail(cropped)
+                return SaveOutput(file, thumb)
+            } finally {
+                cropped.recycle()
+                decoded.recycle()
+            }
+        }
 
         val filename = "IMG_${
             SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())

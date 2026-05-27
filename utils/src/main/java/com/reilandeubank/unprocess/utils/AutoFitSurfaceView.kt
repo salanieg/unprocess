@@ -59,10 +59,10 @@ class AutoFitSurfaceView @JvmOverloads constructor(
         if (aspectRatio == 0f) {
             setMeasuredDimension(width, height)
         } else {
-            // Center-fit using the provided (display-oriented) aspect ratio.
+            // Center-crop using the provided (display-oriented) aspect ratio.
             val newWidth: Int
             val newHeight: Int
-            if (width > height * aspectRatio) {
+            if (width < height * aspectRatio) {
                 newHeight = height
                 newWidth = (height * aspectRatio).roundToInt()
             } else {
