@@ -1,7 +1,6 @@
 package com.reilandeubank.unprocess.filter
 
 import android.graphics.Bitmap
-import android.graphics.Color
 import kotlin.math.abs
 import kotlin.math.cos
 import kotlin.math.exp
@@ -27,8 +26,13 @@ import kotlin.random.Random
  */
 object FilmFilter {
 
-    /** Number of rows processed per chunk — caps peak temp buffer at ~width * 64 * 4 B. */
-    private const val ROW_CHUNK = 64
+    /**
+     * Number of rows processed per chunk. Bigger chunks → fewer native
+     * `getPixels`/`setPixels` calls per worker (each one is a JNI boundary
+     * cross + a memcpy). 256 keeps the per-worker buffer at width*256*4
+     * bytes ≈ 4 MB on a 4000-px capture, well within the heap.
+     */
+    private const val ROW_CHUNK = 256
 
     /** Center hue (degrees) for each of the 8 HSL color ranges. */
     private val HSL_CENTERS = floatArrayOf(0f, 30f, 60f, 120f, 180f, 240f, 270f, 300f)
@@ -52,10 +56,18 @@ object FilmFilter {
 
     private fun processInPlace(bitmap: Bitmap, p: FilmParams): Bitmap {
 
+        // Pre-compose master tone LUT + per-channel curves into a single
+        // 256-entry LUT per channel. In the hot loop this turns 6 array
+        // lookups per pixel (master[r], master[g], master[b], red[r],
+        // green[g], blue[b]) into 3 (redCombined[r], greenCombined[g],
+        // blueCombined[b]) — half the cache traffic on the LUTs.
         val masterLut = buildMasterLut(p)
-        val redLut = buildChannelLut(p.redCurve)
-        val greenLut = buildChannelLut(p.greenCurve)
-        val blueLut = buildChannelLut(p.blueCurve)
+        val rawRedLut = buildChannelLut(p.redCurve)
+        val rawGreenLut = buildChannelLut(p.greenCurve)
+        val rawBlueLut = buildChannelLut(p.blueCurve)
+        val redLut = IntArray(256) { rawRedLut[masterLut[it]] }
+        val greenLut = IntArray(256) { rawGreenLut[masterLut[it]] }
+        val blueLut = IntArray(256) { rawBlueLut[masterLut[it]] }
 
         val tempShift = p.temp / 100f
         val tintShift = p.tint / 100f
@@ -75,114 +87,348 @@ object FilmFilter {
             Vignette(p.vignetteAmount, p.vignetteMidpoint, width, height)
         } else null
 
-        val rowBuf = IntArray(width * ROW_CHUNK)
+        // Decide once whether the filter actually needs the HSV round-trip.
+        // The HSV path costs ~2 JNI calls per pixel; if we only need
+        // vibrance/saturation (which can be done cheaply in RGB), we can
+        // skip it entirely. Dyna in particular hits the fast path here.
+        val needsHsv = anyHslAdj(p) || anyCalibAdj(p) ||
+                p.shadowTint != 0 || p.highlightSat != 0 || p.shadowSat != 0
 
-        var y = 0
-        while (y < height) {
-            val rows = min(ROW_CHUNK, height - y)
-            bitmap.getPixels(rowBuf, 0, width, 0, y, width, rows)
+        val numWorkers = workerCount(height)
+        val chunkRows = ((height + numWorkers - 1) / numWorkers).coerceAtLeast(ROW_CHUNK)
 
-            for (i in 0 until rows * width) {
-                val px = rowBuf[i]
-                val a = px ushr 24 and 0xff
-                var r = px ushr 16 and 0xff
-                var g = px ushr 8 and 0xff
-                var b = px and 0xff
+        // ===== Pass 1: per-pixel tone/colour (parallel) =====
+        // (WB → master tone LUT → per-channel curves → HSL → calibration →
+        //  shadow tint → split toning → vibrance / saturation)
+        //
+        // Workers process disjoint row ranges. Each worker holds its own
+        // rowBuf / hsv / weights buffers so no synchronisation is needed,
+        // and Bitmap.getPixels/setPixels on non-overlapping regions is safe
+        // in practice (the bitmap is just a contiguous pixel buffer).
+        parallelize(numWorkers) { workerIdx ->
+            val startY = workerIdx * chunkRows
+            val endY = min(startY + chunkRows, height)
+            if (startY >= endY) return@parallelize
 
-                // --- White balance (simple scaled multipliers around 1.0) ---
-                if (tempShift != 0f || tintShift != 0f) {
-                    var rf = r / 255f
-                    var gf = g / 255f
-                    var bf = b / 255f
-                    if (tempShift != 0f) {
-                        rf *= 1f + 0.25f * tempShift
-                        bf *= 1f - 0.25f * tempShift
-                    }
-                    if (tintShift != 0f) {
-                        gf *= 1f - 0.20f * tintShift
-                        rf *= 1f + 0.05f * tintShift
-                        bf *= 1f + 0.05f * tintShift
-                    }
-                    r = (rf * 255f).toInt().coerceIn(0, 255)
-                    g = (gf * 255f).toInt().coerceIn(0, 255)
-                    b = (bf * 255f).toInt().coerceIn(0, 255)
-                }
+            val rowBuf = IntArray(width * ROW_CHUNK)
+            val hsv = FloatArray(3)
+            val weights = FloatArray(8)
 
-                // --- Master tone LUT (light adjustments + point curve) ---
-                r = masterLut[r]
-                g = masterLut[g]
-                b = masterLut[b]
+            var y = startY
+            while (y < endY) {
+                val rows = min(ROW_CHUNK, endY - y)
+                bitmap.getPixels(rowBuf, 0, width, 0, y, width, rows)
 
-                // --- Per-channel curves ---
-                r = redLut[r]
-                g = greenLut[g]
-                b = blueLut[b]
+                for (i in 0 until rows * width) {
+                    val px = rowBuf[i]
+                    val a = px ushr 24 and 0xff
+                    var r = px ushr 16 and 0xff
+                    var g = px ushr 8 and 0xff
+                    var b = px and 0xff
 
-                // --- HSL adjustments + calibration shifts on primaries ---
-                val hsv = floatArrayOf(0f, 0f, 0f)
-                Color.RGBToHSV(r, g, b, hsv)
-
-                applyHsl(hsv, p)
-                applyCalibration(hsv, p)
-                applyShadowTint(hsv, p.shadowTint)
-                applySplitToning(hsv, p)
-
-                // --- Vibrance / saturation ---
-                if (vibrance != 0f) {
-                    val s = hsv[1]
-                    val boost = vibrance * (1f - s)
-                    hsv[1] = (s + boost).coerceIn(0f, 1f)
-                }
-                if (saturation != 0f) {
-                    hsv[1] = (hsv[1] * (1f + saturation)).coerceIn(0f, 1f)
-                }
-
-                val rgb = Color.HSVToColor(hsv)
-                r = rgb ushr 16 and 0xff
-                g = rgb ushr 8 and 0xff
-                b = rgb and 0xff
-
-                rowBuf[i] = (a shl 24) or (r shl 16) or (g shl 8) or b
-            }
-
-            // Effects that need pixel coordinates (vignette, grain) — separate
-            // pass keeps the per-pixel inner loop branch-free for the common
-            // adjustments above.
-            if (grain != null || vignette != null) {
-                var idx = 0
-                for (ry in 0 until rows) {
-                    val absY = y + ry
-                    for (x in 0 until width) {
-                        val px = rowBuf[idx]
-                        var r = px ushr 16 and 0xff
-                        var g = px ushr 8 and 0xff
-                        var b = px and 0xff
-                        val a = px ushr 24 and 0xff
-
-                        if (vignette != null) {
-                            val mul = vignette.factorAt(x, absY)
-                            r = (r * mul).toInt().coerceIn(0, 255)
-                            g = (g * mul).toInt().coerceIn(0, 255)
-                            b = (b * mul).toInt().coerceIn(0, 255)
+                    // --- White balance (simple scaled multipliers around 1.0) ---
+                    if (tempShift != 0f || tintShift != 0f) {
+                        var rf = r / 255f
+                        var gf = g / 255f
+                        var bf = b / 255f
+                        if (tempShift != 0f) {
+                            rf *= 1f + 0.25f * tempShift
+                            bf *= 1f - 0.25f * tempShift
                         }
-                        if (grain != null) {
-                            val n = grain.valueAt(x, absY)
-                            r = (r + n).coerceIn(0, 255)
-                            g = (g + n).coerceIn(0, 255)
-                            b = (b + n).coerceIn(0, 255)
+                        if (tintShift != 0f) {
+                            gf *= 1f - 0.20f * tintShift
+                            rf *= 1f + 0.05f * tintShift
+                            bf *= 1f + 0.05f * tintShift
                         }
-
-                        rowBuf[idx] = (a shl 24) or (r shl 16) or (g shl 8) or b
-                        idx++
+                        r = (rf * 255f).toInt().coerceIn(0, 255)
+                        g = (gf * 255f).toInt().coerceIn(0, 255)
+                        b = (bf * 255f).toInt().coerceIn(0, 255)
                     }
+
+                    // --- Master tone + per-channel curves baked into 3 LUTs ---
+                    r = redLut[r]; g = greenLut[g]; b = blueLut[b]
+
+                    if (needsHsv) {
+                        // Full HSL/calibration/split-toning path. Inline
+                        // RGB↔HSV conversion avoids the JNI overhead of
+                        // Color.RGBToHSV / HSVToColor (~50-100 ns each).
+                        rgbToHsv(r, g, b, hsv)
+                        applyHsl(hsv, p, weights)
+                        applyCalibration(hsv, p)
+                        applyShadowTint(hsv, p.shadowTint)
+                        applySplitToning(hsv, p)
+
+                        if (vibrance != 0f) {
+                            val s = hsv[1]
+                            hsv[1] = (s + vibrance * (1f - s)).coerceIn(0f, 1f)
+                        }
+                        if (saturation != 0f) {
+                            hsv[1] = (hsv[1] * (1f + saturation)).coerceIn(0f, 1f)
+                        }
+                        val rgb = hsvToRgb(hsv)
+                        r = rgb ushr 16 and 0xff
+                        g = rgb ushr 8 and 0xff
+                        b = rgb and 0xff
+                    } else if (vibrance != 0f || saturation != 0f) {
+                        // Fast path: blend each channel toward/away from
+                        // luminance. Mathematically equivalent to mul-by-S
+                        // in HSV space, and skips both JNI conversions.
+                        val lumF = 0.299f * r + 0.587f * g + 0.114f * b
+                        var factor = 1f + saturation
+                        if (vibrance != 0f) {
+                            val mx = if (r >= g) (if (r >= b) r else b) else (if (g >= b) g else b)
+                            val mn = if (r <= g) (if (r <= b) r else b) else (if (g <= b) g else b)
+                            val s = if (mx == 0) 0f else (mx - mn).toFloat() / mx
+                            factor += vibrance * (1f - s)
+                        }
+                        if (factor != 1f) {
+                            r = (lumF + (r - lumF) * factor).toInt().coerceIn(0, 255)
+                            g = (lumF + (g - lumF) * factor).toInt().coerceIn(0, 255)
+                            b = (lumF + (b - lumF) * factor).toInt().coerceIn(0, 255)
+                        }
+                    }
+
+                    rowBuf[i] = (a shl 24) or (r shl 16) or (g shl 8) or b
+                }
+
+                bitmap.setPixels(rowBuf, 0, width, 0, y, width, rows)
+                y += rows
+            }
+        }
+
+        // ===== Pass 2: local-contrast (Clarity) =====
+        if (p.clarity != 0) {
+            applyClarity(bitmap, p.clarity / 100f)
+        }
+
+        // ===== Pass 3: position-dependent effects (vignette, grain) =====
+        if (grain != null || vignette != null) {
+            parallelize(numWorkers) { workerIdx ->
+                val startY = workerIdx * chunkRows
+                val endY = min(startY + chunkRows, height)
+                if (startY >= endY) return@parallelize
+                val rowBuf = IntArray(width * ROW_CHUNK)
+                var y = startY
+                while (y < endY) {
+                    val rows = min(ROW_CHUNK, endY - y)
+                    bitmap.getPixels(rowBuf, 0, width, 0, y, width, rows)
+                    var idx = 0
+                    for (ry in 0 until rows) {
+                        val absY = y + ry
+                        for (x in 0 until width) {
+                            val px = rowBuf[idx]
+                            var r = px ushr 16 and 0xff
+                            var g = px ushr 8 and 0xff
+                            var b = px and 0xff
+                            val a = px ushr 24 and 0xff
+
+                            if (vignette != null) {
+                                val mul = vignette.factorAt(x, absY)
+                                r = (r * mul).toInt().coerceIn(0, 255)
+                                g = (g * mul).toInt().coerceIn(0, 255)
+                                b = (b * mul).toInt().coerceIn(0, 255)
+                            }
+                            if (grain != null) {
+                                val n = grain.valueAt(x, absY)
+                                r = (r + n).coerceIn(0, 255)
+                                g = (g + n).coerceIn(0, 255)
+                                b = (b + n).coerceIn(0, 255)
+                            }
+
+                            rowBuf[idx] = (a shl 24) or (r shl 16) or (g shl 8) or b
+                            idx++
+                        }
+                    }
+                    bitmap.setPixels(rowBuf, 0, width, 0, y, width, rows)
+                    y += rows
                 }
             }
-
-            bitmap.setPixels(rowBuf, 0, width, 0, y, width, rows)
-            y += rows
         }
 
         return bitmap
+    }
+
+    // -------- Parallelism --------
+
+    /**
+     * Number of worker threads to use for a bitmap of [height] rows. Capped
+     * by core count (Lightroom-style filters are memory-bandwidth bound at
+     * some point so more than ~6 doesn't help), and capped from below so we
+     * never try to slice the bitmap into chunks smaller than [ROW_CHUNK].
+     */
+    private fun workerCount(height: Int): Int {
+        // Use all available cores up to 8 — most current Android SoCs have
+        // 8 (4 big + 4 little). Above 8 the memory bandwidth becomes the
+        // bottleneck anyway.
+        val cores = Runtime.getRuntime().availableProcessors().coerceIn(1, 8)
+        return min(cores, max(1, height / ROW_CHUNK))
+    }
+
+    /**
+     * Runs [work] N times concurrently with worker index 0..[n]-1. Joins
+     * before returning. Single-threaded fall-through when n == 1 so callers
+     * don't pay the thread-spawn cost on tiny captures.
+     */
+    private fun parallelize(n: Int, work: (Int) -> Unit) {
+        if (n <= 1) { work(0); return }
+        val threads = (0 until n).map { idx ->
+            Thread({ work(idx) }, "FilmFilter-$idx").apply { isDaemon = true }
+        }
+        threads.forEach { it.start() }
+        threads.forEach { it.join() }
+    }
+
+    private fun anyHslAdj(p: FilmParams): Boolean {
+        for (i in 0..7) {
+            if (p.hslHue[i] != 0 || p.hslSat[i] != 0 || p.hslLum[i] != 0) return true
+        }
+        return false
+    }
+
+    private fun anyCalibAdj(p: FilmParams): Boolean =
+        p.redPrimaryHue != 0 || p.redPrimarySat != 0 ||
+        p.greenPrimaryHue != 0 || p.greenPrimarySat != 0 ||
+        p.bluePrimaryHue != 0 || p.bluePrimarySat != 0
+
+    // -------- Clarity (local-contrast enhancement) --------
+
+    /**
+     * Lightroom-style "Clarity" — boosts mid-frequency luminance contrast so
+     * the image looks crisper / more "HDR" without affecting global tonality
+     * or colour saturation (much).
+     *
+     * Implementation: extract a luminance plane from a downscaled copy of
+     * the bitmap, separable-box-blur it (3 passes ≈ Gaussian), then walk the
+     * full bitmap and add `amount * (pixelLum − blurredLum)` to each channel.
+     * Effect is gated to the mid-tonal range so it doesn't crush already-dark
+     * shadows or blow out highlights — that's where "details lost" usually
+     * comes from with naive clarity.
+     */
+    private fun applyClarity(bitmap: Bitmap, amount: Float) {
+        if (amount == 0f) return
+        val w = bitmap.width
+        val h = bitmap.height
+
+        // Downsample so the blur is cheap. 1/8 keeps a 4000-px wide capture
+        // at 500 px wide for the blur step.
+        val scaleDown = 8
+        val smallW = max(8, w / scaleDown)
+        val smallH = max(8, h / scaleDown)
+
+        val small = Bitmap.createScaledBitmap(bitmap, smallW, smallH, true)
+        val smallPixels = IntArray(smallW * smallH)
+        small.getPixels(smallPixels, 0, smallW, 0, 0, smallW, smallH)
+        if (small !== bitmap) small.recycle()
+
+        // Extract BT.601 luminance into a float plane.
+        val lum = FloatArray(smallW * smallH)
+        for (i in smallPixels.indices) {
+            val px = smallPixels[i]
+            val r = (px ushr 16) and 0xff
+            val g = (px ushr 8) and 0xff
+            val b = px and 0xff
+            lum[i] = 0.299f * r + 0.587f * g + 0.114f * b
+        }
+
+        val blurred = separableBoxBlur(lum, smallW, smallH, radius = 6, passes = 3)
+
+        val strength = (amount * 0.45f).coerceIn(-1f, 1f)
+        val invScale = 1f / scaleDown.toFloat()
+
+        // Pre-compute the x→blurred-column lookup once per call. The blurred
+        // plane was already gauss-smoothed at 1/8 resolution, so nearest-
+        // neighbour sampling is visually indistinguishable from bilinear
+        // and saves 4 array reads + 4 mul + 3 add per pixel.
+        val xSamples = IntArray(w) { x ->
+            (x * invScale).toInt().coerceIn(0, smallW - 1)
+        }
+
+        // The application pass is per-pixel and easily parallelisable —
+        // each worker owns its own rowBuf, the blurred plane is read-only.
+        val numWorkers = workerCount(h)
+        val chunkRows = ((h + numWorkers - 1) / numWorkers).coerceAtLeast(ROW_CHUNK)
+
+        parallelize(numWorkers) { workerIdx ->
+            val startY = workerIdx * chunkRows
+            val endY = min(startY + chunkRows, h)
+            if (startY >= endY) return@parallelize
+            val rowBuf = IntArray(w * ROW_CHUNK)
+            var y = startY
+            while (y < endY) {
+                val rows = min(ROW_CHUNK, endY - y)
+                bitmap.getPixels(rowBuf, 0, w, 0, y, w, rows)
+                for (ry in 0 until rows) {
+                    val sy = ((y + ry) * invScale).toInt().coerceIn(0, smallH - 1)
+                    val syRow = sy * smallW
+
+                    for (x in 0 until w) {
+                        val bL = blurred[syRow + xSamples[x]]
+
+                        val idx = ry * w + x
+                        val px = rowBuf[idx]
+                        val a = px ushr 24 and 0xff
+                        var r = px ushr 16 and 0xff
+                        var g = px ushr 8 and 0xff
+                        var bl = px and 0xff
+
+                        val pxLum = 0.299f * r + 0.587f * g + 0.114f * bl
+                        val detail = pxLum - bL
+                        val midWeight = 1f - abs(pxLum / 255f - 0.5f) * 2f
+                        val dMag = abs(detail)
+                        val edgeFalloff = 1f / (1f + (dMag * dMag) * (1f / 6400f))
+                        val delta = (detail * strength * (0.4f + 0.6f * midWeight) * edgeFalloff).toInt()
+
+                        r = (r + delta).coerceIn(0, 255)
+                        g = (g + delta).coerceIn(0, 255)
+                        bl = (bl + delta).coerceIn(0, 255)
+
+                        rowBuf[idx] = (a shl 24) or (r shl 16) or (g shl 8) or bl
+                    }
+                }
+                bitmap.setPixels(rowBuf, 0, w, 0, y, w, rows)
+                y += rows
+            }
+        }
+    }
+
+    /**
+     * Separable box blur via rolling sum (O(w·h) per pass per direction).
+     * [passes] = 3 closely approximates a Gaussian with σ ≈ radius·√(passes/3).
+     */
+    private fun separableBoxBlur(src: FloatArray, w: Int, h: Int, radius: Int, passes: Int): FloatArray {
+        val count = (2 * radius + 1).toFloat()
+        var a = src.copyOf()
+        var b = FloatArray(w * h)
+        repeat(passes) {
+            // Horizontal
+            for (y in 0 until h) {
+                val rowStart = y * w
+                var sum = 0f
+                for (k in -radius..radius) sum += a[rowStart + k.coerceIn(0, w - 1)]
+                b[rowStart] = sum / count
+                for (x in 1 until w) {
+                    val leaving = (x - 1 - radius).coerceIn(0, w - 1)
+                    val entering = (x + radius).coerceIn(0, w - 1)
+                    sum += a[rowStart + entering] - a[rowStart + leaving]
+                    b[rowStart + x] = sum / count
+                }
+            }
+            run { val t = a; a = b; b = t }
+            // Vertical
+            for (x in 0 until w) {
+                var sum = 0f
+                for (k in -radius..radius) sum += a[k.coerceIn(0, h - 1) * w + x]
+                b[x] = sum / count
+                for (y in 1 until h) {
+                    val leaving = (y - 1 - radius).coerceIn(0, h - 1)
+                    val entering = (y + radius).coerceIn(0, h - 1)
+                    sum += a[entering * w + x] - a[leaving * w + x]
+                    b[y * w + x] = sum / count
+                }
+            }
+            run { val t = a; a = b; b = t }
+        }
+        return a
     }
 
     // -------- LUT construction --------
@@ -263,6 +509,59 @@ object FilmFilter {
         return x
     }
 
+    // -------- Inline RGB↔HSV --------
+    //
+    // Equivalent to Color.RGBToHSV / Color.HSVToColor, but pure Kotlin
+    // so the JIT can inline them into the per-pixel loop and skip the JNI
+    // boundary cross (~50-100 ns each, ~2 s saved across 12 MP × 2 calls).
+
+    private fun rgbToHsv(r: Int, g: Int, b: Int, hsv: FloatArray) {
+        val mx = if (r >= g) (if (r >= b) r else b) else (if (g >= b) g else b)
+        val mn = if (r <= g) (if (r <= b) r else b) else (if (g <= b) g else b)
+        val delta = mx - mn
+        hsv[2] = mx / 255f
+        hsv[1] = if (mx == 0) 0f else delta.toFloat() / mx
+        if (delta == 0) {
+            hsv[0] = 0f
+        } else {
+            val df = delta.toFloat()
+            var h = when (mx) {
+                r -> 60f * ((g - b) / df)
+                g -> 60f * ((b - r) / df) + 120f
+                else -> 60f * ((r - g) / df) + 240f
+            }
+            if (h < 0f) h += 360f
+            hsv[0] = h
+        }
+    }
+
+    /** Returns RGB packed as 0x00RRGGBB (alpha is not set). */
+    private fun hsvToRgb(hsv: FloatArray): Int {
+        val s = hsv[1]
+        val v = hsv[2]
+        if (s == 0f) {
+            val gray = (v * 255f).toInt().coerceIn(0, 255)
+            return (gray shl 16) or (gray shl 8) or gray
+        }
+        val hh = hsv[0] / 60f
+        val c = v * s
+        val x = c * (1f - abs(hh.mod(2f) - 1f))
+        val m = v - c
+        val r1: Float; val g1: Float; val b1: Float
+        when (hh.toInt()) {
+            0 -> { r1 = c; g1 = x; b1 = 0f }
+            1 -> { r1 = x; g1 = c; b1 = 0f }
+            2 -> { r1 = 0f; g1 = c; b1 = x }
+            3 -> { r1 = 0f; g1 = x; b1 = c }
+            4 -> { r1 = x; g1 = 0f; b1 = c }
+            else -> { r1 = c; g1 = 0f; b1 = x }
+        }
+        val r = ((r1 + m) * 255f).toInt().coerceIn(0, 255)
+        val g = ((g1 + m) * 255f).toInt().coerceIn(0, 255)
+        val b = ((b1 + m) * 255f).toInt().coerceIn(0, 255)
+        return (r shl 16) or (g shl 8) or b
+    }
+
     // -------- HSL --------
 
     /**
@@ -289,9 +588,11 @@ object FilmFilter {
         }
     }
 
-    private val tmpWeights = FloatArray(8)
-
-    private fun applyHsl(hsv: FloatArray, p: FilmParams) {
+    /**
+     * [weights] is a 8-entry scratch buffer the caller owns (so this is
+     * thread-safe — each worker passes its own buffer).
+     */
+    private fun applyHsl(hsv: FloatArray, p: FilmParams, weights: FloatArray) {
         // Cheap fast-path: skip the trig+weighting if all adjustments are 0.
         var anyAdj = false
         for (i in 0..7) {
@@ -299,12 +600,12 @@ object FilmFilter {
         }
         if (!anyAdj) return
 
-        hueWeights(hsv[0], tmpWeights)
+        hueWeights(hsv[0], weights)
         var hueShift = 0f
         var satFactor = 1f
         var lumFactor = 1f
         for (i in 0..7) {
-            val w = tmpWeights[i]
+            val w = weights[i]
             if (w == 0f) continue
             hueShift += w * p.hslHue[i] * 0.36f  // ±100 → ±36°
             satFactor += w * p.hslSat[i] / 100f

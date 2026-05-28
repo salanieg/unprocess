@@ -78,138 +78,236 @@ data class FilmParams(
 /**
  * The user-selectable film simulations. Cycled in this declaration order via
  * the camera-screen filter button. [NORMAL] is the identity (no processing).
+ *
+ * The three film looks aim at the characteristic colour signature of their
+ * real-world emulsions:
+ *
+ * - GOLD   — Kodak Gold 200: warm golden/amber cast, soft pleasing skin tones,
+ *            lifted shadows with a hint of warmth, slightly muted greens and
+ *            blues, gentle contrast.
+ * - SUPER  — Fujifilm Superia X-Tra 400: slightly cool, signature green-cyan
+ *            cast in the shadows, vibrant greens and cyan-shifted blues, more
+ *            contrast and grain than Gold.
+ * - NECTAR — Kodak Ektar 100: fine grain, high saturation but smooth (no
+ *            crushed shadows or clipped colour blobs), neutral-to-slightly-cool
+ *            tonality, vivid yet smooth blues, magenta-shifted reds.
+ *
+ * Values are intentionally moderate compared to a literal LR-recipe transcript:
+ * combining strong contrast with strong HSL saturation tends to flatten busy
+ * regions into solid-colour patches ("Flächen verschluckt"), so each filter
+ * leans on *vibrance* (which respects already-saturated pixels) over flat
+ * saturation, and keeps Light/HSL pushes in a range that doesn't clip when
+ * stacked with the master tone curve and calibration.
  */
 enum class FilmSimulation(val displayName: String, val params: FilmParams) {
     NORMAL(
         displayName = "Normal",
         params = FilmParams(),
     ),
+
+    // -------- Kodak Gold 200 --------
+    //
+    // Signature: warm amber, slightly green-yellow midtones, lifted shadows,
+    // soft highlights, restrained greens & blues, fine-medium grain.
     GOLD(
         displayName = "Gold",
         params = FilmParams(
-            contrast = 12, highlights = -18, shadows = 22, whites = -8, blacks = 15,
-            temp = 9, tint = 4, vibrance = 12, saturation = 4,
-            pointCurve = listOf(0 to 12, 64 to 60, 192 to 200, 255 to 248),
-            redCurve = listOf(0 to 8, 255 to 250),
-            blueCurve = listOf(0 to 18, 255 to 235),
+            contrast = 6,
+            highlights = -10,
+            shadows = 14,
+            whites = -4,
+            blacks = 8,
+            temp = 14, tint = 3,
+            vibrance = 10, saturation = 0,
+            // Lifted black point, gentle highlight roll-off — the typical
+            // "film matte" toe-and-shoulder.
+            pointCurve = listOf(0 to 14, 64 to 66, 192 to 196, 255 to 246),
+            // Slightly warmer red channel, distinctly warmer blue channel
+            // (blue shadows lifted toward cyan-yellow, blue highlights pulled
+            // down → overall amber cast).
+            redCurve = listOf(0 to 6, 255 to 252),
+            blueCurve = listOf(0 to 14, 128 to 122, 255 to 226),
             hslHue = FilmParams.hsl(
-                FilmParams.HSL_RED to 6,
-                FilmParams.HSL_ORANGE to 4,
-                FilmParams.HSL_YELLOW to 12,
-                FilmParams.HSL_GREEN to 10,
-            ),
-            hslSat = FilmParams.hsl(
-                FilmParams.HSL_RED to 8,
-                FilmParams.HSL_ORANGE to 12,
-                FilmParams.HSL_YELLOW to 15,
-                FilmParams.HSL_GREEN to -8,
-                FilmParams.HSL_BLUE to -15,
-            ),
-            hslLum = FilmParams.hsl(
-                FilmParams.HSL_YELLOW to 10,
-                FilmParams.HSL_BLUE to -12,
-            ),
-            shadowTint = 5,
-            redPrimaryHue = 8, redPrimarySat = 6,
-            greenPrimaryHue = -10, greenPrimarySat = 5,
-            bluePrimaryHue = 12, bluePrimarySat = 10,
-            grainAmount = 22, grainSize = 25, grainRoughness = 50,
-            vignetteAmount = -10, vignetteMidpoint = 50,
-        ),
-    ),
-    SUPER(
-        displayName = "Super",
-        params = FilmParams(
-            contrast = 10, highlights = -12, shadows = 15, whites = -5, blacks = 12,
-            temp = -3, tint = -5, vibrance = 10, saturation = 5,
-            pointCurve = listOf(0 to 10, 96 to 90, 160 to 170, 255 to 255),
-            greenCurve = listOf(0 to 12, 255 to 248),
-            blueCurve = listOf(0 to 8, 128 to 120, 255 to 245),
-            hslHue = FilmParams.hsl(
-                FilmParams.HSL_RED to 4,
-                FilmParams.HSL_GREEN to -12,
-                FilmParams.HSL_BLUE to 6,
-            ),
-            hslSat = FilmParams.hsl(
-                FilmParams.HSL_RED to 12,
-                FilmParams.HSL_ORANGE to 8,
-                FilmParams.HSL_YELLOW to 6,
-                FilmParams.HSL_GREEN to 10,
-                FilmParams.HSL_BLUE to -10,
-                FilmParams.HSL_MAGENTA to 8,
-            ),
-            hslLum = FilmParams.hsl(
-                FilmParams.HSL_GREEN to 8,
-                FilmParams.HSL_BLUE to -15,
-            ),
-            shadowTint = -8,
-            redPrimaryHue = 0, redPrimarySat = 8,
-            greenPrimaryHue = 8, greenPrimarySat = 12,
-            bluePrimarySat = 6,
-            grainAmount = 32, grainSize = 30, grainRoughness = 55,
-        ),
-    ),
-    NECTAR(
-        displayName = "Nectar",
-        params = FilmParams(
-            contrast = 18, highlights = -15, shadows = 12, whites = 8, blacks = -5,
-            temp = -2, tint = 0, vibrance = 15, saturation = 10,
-            pointCurve = listOf(0 to 0, 64 to 52, 192 to 205, 255 to 255),
-            hslHue = FilmParams.hsl(
-                FilmParams.HSL_ORANGE to -4,
-                FilmParams.HSL_BLUE to -8,
-            ),
-            hslSat = FilmParams.hsl(
-                FilmParams.HSL_RED to 15,
-                FilmParams.HSL_ORANGE to 6,
-                FilmParams.HSL_YELLOW to 8,
-                FilmParams.HSL_GREEN to 10,
-                FilmParams.HSL_BLUE to 15,
-                FilmParams.HSL_MAGENTA to 10,
-            ),
-            hslLum = FilmParams.hsl(
-                FilmParams.HSL_RED to -8,
-                FilmParams.HSL_ORANGE to 6,
-                FilmParams.HSL_BLUE to -18,
-            ),
-            redPrimaryHue = 6, redPrimarySat = 12,
-            greenPrimaryHue = -8, greenPrimarySat = 10,
-            bluePrimaryHue = 10, bluePrimarySat = 15,
-            clarity = 10, structure = 8,
-            grainAmount = 6, grainSize = 20, grainRoughness = 50,
-        ),
-    ),
-    PLUS(
-        displayName = "Plus",
-        params = FilmParams(
-            contrast = 6, highlights = -10, shadows = 15, whites = -6, blacks = 14,
-            temp = 8, tint = 3, vibrance = 8, saturation = 2,
-            pointCurve = listOf(0 to 13, 96 to 96, 160 to 168, 255 to 245),
-            redCurve = listOf(0 to 10, 255 to 252),
-            blueCurve = listOf(0 to 15, 255 to 240),
-            hslHue = FilmParams.hsl(
-                FilmParams.HSL_RED to 5,
-                FilmParams.HSL_ORANGE to 3,
+                FilmParams.HSL_ORANGE to 4,    // skin slightly warmer
+                FilmParams.HSL_YELLOW to 8,    // yellow → greenish-yellow
                 FilmParams.HSL_GREEN to 6,
             ),
             hslSat = FilmParams.hsl(
-                FilmParams.HSL_RED to 8,
+                FilmParams.HSL_RED to 6,
                 FilmParams.HSL_ORANGE to 10,
-                FilmParams.HSL_YELLOW to 5,
-                FilmParams.HSL_GREEN to -8,
-                FilmParams.HSL_BLUE to -12,
+                FilmParams.HSL_YELLOW to 10,
+                FilmParams.HSL_GREEN to -6,    // muted greens
+                FilmParams.HSL_BLUE to -10,    // muted blues
+                FilmParams.HSL_AQUA to -6,
+            ),
+            hslLum = FilmParams.hsl(
+                FilmParams.HSL_YELLOW to 6,
+                FilmParams.HSL_BLUE to -4,
+            ),
+            shadowTint = 4,                    // warm shadow tint (magenta-ish)
+            redPrimarySat = 4,
+            greenPrimaryHue = -6,
+            grainAmount = 18, grainSize = 25, grainRoughness = 50,
+            vignetteAmount = -6, vignetteMidpoint = 55,
+        ),
+    ),
+
+    // -------- Fujifilm Superia X-Tra 400 --------
+    //
+    // Signature: cool/neutral overall, green-cyan shadow cast, vibrant greens,
+    // cyan-leaning blues, slightly muted skin warmth, visible grain.
+    SUPER(
+        displayName = "Super",
+        params = FilmParams(
+            contrast = 9,
+            highlights = -10,
+            shadows = 12,
+            whites = -4,
+            blacks = 10,
+            temp = -5, tint = -6,              // cool + slight green
+            vibrance = 12, saturation = 3,
+            // Mild S-curve, slight black-point lift (less than Gold —
+            // Superia has more snap in the shadows).
+            pointCurve = listOf(0 to 8, 64 to 60, 192 to 202, 255 to 250),
+            // Green channel lifted in shadows → trademark Superia "green cast"
+            // in dark mid-tones. Blue lifted in shadows, slightly pulled at
+            // top → cyan-leaning highlights.
+            greenCurve = listOf(0 to 12, 255 to 248),
+            blueCurve = listOf(0 to 10, 128 to 130, 255 to 244),
+            hslHue = FilmParams.hsl(
+                FilmParams.HSL_RED to 3,
+                FilmParams.HSL_YELLOW to -4,   // yellow → greenish
+                FilmParams.HSL_GREEN to -8,    // green → cyan
+                FilmParams.HSL_AQUA to -4,
+                FilmParams.HSL_BLUE to 4,      // blue → cyan
+            ),
+            hslSat = FilmParams.hsl(
+                FilmParams.HSL_RED to 6,
+                FilmParams.HSL_ORANGE to 4,
+                FilmParams.HSL_YELLOW to 4,
+                FilmParams.HSL_GREEN to 12,    // vivid greens — Superia hallmark
+                FilmParams.HSL_AQUA to 10,
+                FilmParams.HSL_BLUE to 6,
                 FilmParams.HSL_MAGENTA to 4,
             ),
             hslLum = FilmParams.hsl(
-                FilmParams.HSL_RED to -5,
-                FilmParams.HSL_BLUE to -10,
+                FilmParams.HSL_GREEN to 6,
+                FilmParams.HSL_BLUE to -8,
             ),
-            shadowTint = 6,
-            redPrimaryHue = 6, redPrimarySat = 5,
-            bluePrimaryHue = 8, bluePrimarySat = 6,
-            highlightHue = 20, highlightSat = 8,
-            shadowHue = 30, shadowSat = 6,
-            grainAmount = 26, grainSize = 28, grainRoughness = 50,
+            shadowTint = -8,                   // green shadow tint
+            redPrimarySat = 4,
+            greenPrimaryHue = 6, greenPrimarySat = 10,
+            bluePrimarySat = 5,
+            grainAmount = 28, grainSize = 28, grainRoughness = 55,
+            vignetteAmount = -4, vignetteMidpoint = 55,
+        ),
+    ),
+
+    // -------- Kodak Ektar 100 --------
+    //
+    // Signature: fine grain, vivid but smooth colour, neutral-to-slightly-cool
+    // tonality, deep but not crushed blues, magenta-shifted reds, gentle
+    // contrast (key to keeping saturated areas from flattening).
+    //
+    // The old recipe used contrast +18 plus an aggressive S-curve plus +15
+    // HSL sat for several channels plus calibration on top — that stacked
+    // into flat-colour blobs in saturated regions ("Flächen verschluckt").
+    // This rebuild keeps the look but cuts the extremes roughly in half and
+    // leans on vibrance (which preserves already-saturated pixels) instead
+    // of flat HSL saturation pumping.
+    NECTAR(
+        displayName = "Nectar",
+        params = FilmParams(
+            contrast = 8,                      // was 18 — main cause of crushing
+            highlights = -8,
+            shadows = 8,
+            whites = 0,
+            blacks = 4,                        // small lift, no negative crush
+            temp = -3, tint = 3,               // slightly cool, faint magenta
+            vibrance = 18, saturation = 4,     // vibrance does the heavy lifting
+            // Gentle S, lifted-but-not-flat blacks, no highlight clipping.
+            pointCurve = listOf(0 to 4, 64 to 60, 192 to 198, 255 to 252),
+            // Channel curves nearly neutral — Ektar's character is in the
+            // HSL/primary domain, not in per-channel curve shaping.
+            redCurve = listOf(0 to 3, 255 to 253),
+            blueCurve = listOf(0 to 5, 255 to 248),
+            hslHue = FilmParams.hsl(
+                FilmParams.HSL_RED to 3,       // red → slight magenta
+                FilmParams.HSL_ORANGE to 2,
+                FilmParams.HSL_GREEN to -6,    // green → cyan-leaning
+                FilmParams.HSL_AQUA to -4,
+                FilmParams.HSL_BLUE to -4,     // blue → toward cyan (Ektar blues)
+            ),
+            hslSat = FilmParams.hsl(           // moderate, was +15 across the board
+                FilmParams.HSL_RED to 10,
+                FilmParams.HSL_ORANGE to 8,
+                FilmParams.HSL_YELLOW to 6,
+                FilmParams.HSL_GREEN to 8,
+                FilmParams.HSL_AQUA to 10,
+                FilmParams.HSL_BLUE to 10,
+                FilmParams.HSL_MAGENTA to 6,
+            ),
+            hslLum = FilmParams.hsl(
+                FilmParams.HSL_RED to -2,
+                FilmParams.HSL_ORANGE to 2,
+                FilmParams.HSL_GREEN to 2,
+                FilmParams.HSL_BLUE to -4,     // was -18 — main cause of dark blue blobs
+            ),
+            // Mild calibration touch — without this Ektar loses some of its
+            // characteristic primary shift, but +6/+5/+8 keeps it from
+            // doubling up with HSL into clipping.
+            redPrimaryHue = 4, redPrimarySat = 6,
+            greenPrimaryHue = -4, greenPrimarySat = 4,
+            bluePrimaryHue = 6, bluePrimarySat = 8,
+            grainAmount = 5, grainSize = 18, grainRoughness = 40,
+        ),
+    ),
+
+    // -------- Dyna (Pro DSLR HDR-Look) --------
+    //
+    // Goal: the restrained, natural-looking HDR mode you'd get out of a
+    // modern pro DSLR/mirrorless body (Sony α7, Canon R5, Nikon Z9 ADL/HDR).
+    // Reveals shadow/highlight detail and adds a touch of local contrast —
+    // and that's it. No colour shifts, no saturation pumping, no HSL
+    // remapping. The eye reads it as "the same scene, just with more
+    // dynamic range visible".
+    //
+    // The previous Dyna was tuned like an over-cooked Instagram HDR
+    // (shadows +80, HSL Blue +18, clarity 55 at a strong scaling). That
+    // crushed the tonal range into a narrow band, then asked Clarity to
+    // re-expand it — which produces edge halos and flat colour blocks
+    // ("Flächen verschwinden"). This version stays in a tonal range where
+    // Clarity can do its job without artefacts.
+    DYNA(
+        displayName = "Dyna",
+        params = FilmParams(
+            // No global contrast change. Pro HDR modes don't push contrast —
+            // they actually reduce it slightly to fit more range in.
+            contrast = 0,
+            // Moderate, not aggressive. Enough to bring detail back from
+            // clipped highlights and crushed shadows without flattening
+            // the midtones into the kind of compressed band that makes
+            // Clarity halo.
+            highlights = -35,
+            shadows = 38,
+            whites = -5,
+            blacks = 5,
+            // NO white-balance shift. "Nichts wo sich die Farbe krass ändert."
+            temp = 0, tint = 0,
+            // Vibrance for the colour pop, a touch of flat saturation on
+            // top. Still well below anything that would push hues into
+            // flat colour blocks at the HSL stage.
+            vibrance = 14, saturation = 8,
+            // Almost-linear master curve with the tiniest toe lift and
+            // shoulder pull, so blacks/whites have a hair of headroom for
+            // Clarity to work in without clipping.
+            pointCurve = listOf(0 to 4, 255 to 251),
+            // No HSL hue, saturation, or luminance adjustments — colour
+            // rendition stays exactly as captured.
+            // Clarity is the defining trait. 45 with the strength 0.45
+            // scaling + edge-attenuation in FilmFilter still stays clear
+            // of haloing on high-contrast edges.
+            clarity = 45,
         ),
     );
 

@@ -517,7 +517,20 @@ class CameraFragment : Fragment() {
 
         setButtonActiveStyle(binding.aspectRatioToggle, true)
         setButtonActiveStyle(binding.modeToggle, true)
-        setButtonActiveStyle(binding.filterToggle, true)
+
+        // The filter only takes effect on the RAW→Bitmap→JPEG conversion
+        // path. In pure RAW (DNG) mode the saved file is just the sensor
+        // mosaic + metadata, which can't carry these Lightroom-style
+        // adjustments — so the filter button is greyed out there to make
+        // its non-effect visually obvious.
+        //
+        // Also disabled during the save flow: the selected filter is
+        // captured at shutter press and used through the whole pipeline,
+        // letting the user change it mid-flight would be confusing (was
+        // the saved image processed with the old or the new filter?).
+        val filterAvailable = !isProcessing && isJpeg
+        setButtonActiveStyle(binding.filterToggle, filterAvailable)
+        binding.filterToggle?.isEnabled = filterAvailable
 
         updateAspectRatioUI()
         updateFlashUI()
@@ -527,6 +540,13 @@ class CameraFragment : Fragment() {
 
     private fun updateFilterUI() {
         fragmentCameraBinding.filterToggle?.text = filmSimulation.displayName
+    }
+
+    /** Flips [isProcessing] and refreshes the settings UI (which gates the
+     *  filter toggle's isEnabled state on this flag). */
+    private fun setProcessing(value: Boolean) {
+        isProcessing = value
+        updateSettingsUI()
     }
 
     private fun setButtonActiveStyle(button: com.google.android.material.button.MaterialButton?, active: Boolean) {
@@ -578,6 +598,10 @@ class CameraFragment : Fragment() {
     /** True while the Done overlay (saved image) is visible — in that state
      *  the capture button doubles as "Take new". */
     private var isShowingDone: Boolean = false
+
+    /** True from the moment of the capture press until the save (or error
+     *  fallback) has finished — drives the "Developing…" button label. */
+    private var isProcessing: Boolean = false
 
     /** Lifecycle stage of a capture, drives the overlay state machine. */
     private sealed class CaptureProgress {
@@ -685,7 +709,11 @@ class CameraFragment : Fragment() {
         val button = _fragmentCameraBinding?.captureButton
                 as? com.google.android.material.button.MaterialButton ?: return
         button.text = getString(
-            if (isShowingDone) R.string.progress_take_new else R.string.capture
+            when {
+                isShowingDone -> R.string.progress_take_new
+                isProcessing -> R.string.progress_developing
+                else -> R.string.capture
+            }
         )
     }
 
@@ -988,6 +1016,7 @@ class CameraFragment : Fragment() {
         // the button is re-enabled and rebadged as "Take new" by
         // showProgress(Done) → updateCaptureButtonForState.
         button.isEnabled = false
+        setProcessing(true)
 
         viewLifecycleOwner.lifecycleScope.launch {
             // Single dim from button-press through save-complete — no
@@ -1041,12 +1070,14 @@ class CameraFragment : Fragment() {
                 // Done state stays up until the user taps "Take new" on the
                 // capture button — re-enable the button so it can act as
                 // that dismiss control.
+                setProcessing(false)
                 showProgress(CaptureProgress.Done(saved.thumbnail))
                 button.isEnabled = true
             } catch (exc: Exception) {
                 Log.e(TAG, "Photo capture failed", exc)
                 showProgress(CaptureProgress.Failed(exc.message ?: "Unknown"))
                 kotlinx.coroutines.delay(ERROR_INDICATOR_MILLIS)
+                setProcessing(false)
                 hideProgress()
                 button.isEnabled = true
             }
@@ -1299,18 +1330,22 @@ class CameraFragment : Fragment() {
      * denoising, no sharpening, no tone mapping.
      */
     private fun rawToBitmap(result: CombinedCaptureResult): Bitmap {
+        // In-memory DNG roundtrip: write to a ByteArrayOutputStream and
+        // decode straight from the byte[]. Avoids two disk I/Os (write to
+        // cache, read back) per capture — typically ~100-200 ms on a
+        // 12-MP DNG, plus the delete() syscall.
         val dngCreator = DngCreator(characteristics, result.metadata)
-        val tempDngFile = File(requireContext().cacheDir, "temp.dng")
-        FileOutputStream(tempDngFile).use { stream ->
-            dngCreator.writeImage(stream, result.image)
-        }
-        val decoded = BitmapFactory.decodeFile(tempDngFile.absolutePath)
-        tempDngFile.delete()
-        if (decoded == null) {
-            throw IOException(
+        val baos = java.io.ByteArrayOutputStream(8 * 1024 * 1024)
+        dngCreator.writeImage(baos, result.image)
+        val dngBytes = baos.toByteArray()
+        // inMutable=true means the decoded bitmap is mutable from the start,
+        // so FilmFilter can write to it in place without first having to
+        // allocate and copy a ~48 MB mutable replica.
+        val opts = BitmapFactory.Options().apply { inMutable = true }
+        val decoded = BitmapFactory.decodeByteArray(dngBytes, 0, dngBytes.size, opts)
+            ?: throw IOException(
                 "BitmapFactory could not decode DNG on this device — pick \"Save as RAW\" instead.",
             )
-        }
         val rotated = if (result.rotationDegrees != 0) {
             val matrix = android.graphics.Matrix().apply {
                 postRotate(result.rotationDegrees.toFloat())
@@ -1340,7 +1375,12 @@ class CameraFragment : Fragment() {
             val uri = resolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, contentValues)
                 ?: throw IOException("Failed to create MediaStore entry")
             resolver.openOutputStream(uri)?.use { stream ->
-                bitmap.compress(Bitmap.CompressFormat.JPEG, 100, stream)
+                // Wrap with a BufferedOutputStream — MediaStore streams write
+                // through to the storage layer per call; buffering lets the
+                // JPEG encoder dump larger chunks at once.
+                java.io.BufferedOutputStream(stream, 64 * 1024).use { buf ->
+                    bitmap.compress(Bitmap.CompressFormat.JPEG, 95, buf)
+                }
             }
             val dcim = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DCIM)
             File(File(dcim, "Camera"), filename)
@@ -1348,7 +1388,9 @@ class CameraFragment : Fragment() {
             val dcim = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DCIM)
             val file = File(File(dcim, "Camera").apply { if (!exists()) mkdirs() }, filename)
             FileOutputStream(file).use { stream ->
-                bitmap.compress(Bitmap.CompressFormat.JPEG, 100, stream)
+                java.io.BufferedOutputStream(stream, 64 * 1024).use { buf ->
+                    bitmap.compress(Bitmap.CompressFormat.JPEG, 95, buf)
+                }
             }
             file
         }
