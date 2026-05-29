@@ -87,25 +87,4 @@
 
     </fragment>
 
-    <fragment
-        android:id="@+id/image_viewer_fragment"
-        android:name="com.reilandeubank.unprocess.fragments.ImageViewerFragment"
-        android:label="Image Viewer">
-
-        <argument
-            android:name="file_path"
-            app:argType="string"
-            app:nullable="false" />
-
-        <argument
-            android:name="orientation"
-            android:defaultValue="0"
-            app:argType="integer" />
-
-        <argument
-            android:name="depth"
-            android:defaultValue="false"
-            app:argType="boolean" />
-    </fragment>
-
 </navigation>

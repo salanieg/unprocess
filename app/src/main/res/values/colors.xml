@@ -3,4 +3,5 @@
     <color name="primary">#D0BCFF</color>
     <color name="secondary">#CCC2DC</color>
     <color name="tertiary">#EFB8C8</color>
+    <color name="ic_launcher_background">#555555</color>
 </resources>
