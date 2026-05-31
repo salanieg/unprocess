@@ -156,10 +156,18 @@ class CameraFragment : Fragment() {
     private enum class OutputFormat { RAW, JPEG, WEBP }
     private var outputFormat: OutputFormat = OutputFormat.JPEG
     private var flashMode: Int = CaptureRequest.CONTROL_AE_MODE_ON
-    private var isSquare: Boolean = false
+    private enum class AspectRatio { RATIO_1_1, RATIO_4_3, RATIO_16_9 }
+    private var aspectRatio: AspectRatio = AspectRatio.RATIO_4_3
 
     private var isSettingsMode = false
     private var isAnimatingSettings = false
+
+    private var isVideoMode: Boolean = false
+    private var isRecordingVideo: Boolean = false
+    private var mediaRecorder: android.media.MediaRecorder? = null
+    private var videoUri: android.net.Uri? = null
+    private var videoFileDescriptor: android.os.ParcelFileDescriptor? = null
+    private var currentVideoFile: File? = null
 
     /** Currently selected film simulation. Cycled via the filter toggle. */
     private var filmSimulation: FilmSimulation = FilmSimulation.NORMAL
@@ -191,8 +199,18 @@ class CameraFragment : Fragment() {
                 else -> OutputFormat.JPEG
             }
         }
-        isSquare = sharedPrefs.getBoolean("pref_is_square", false)
+        val savedRatio = sharedPrefs.getString("pref_aspect_ratio", AspectRatio.RATIO_4_3.name)
+        aspectRatio = try {
+            AspectRatio.valueOf(savedRatio ?: AspectRatio.RATIO_4_3.name)
+        } catch (e: Exception) {
+            if (sharedPrefs.getBoolean("pref_is_square", false)) {
+                AspectRatio.RATIO_1_1
+            } else {
+                AspectRatio.RATIO_4_3
+            }
+        }
         flashMode = sharedPrefs.getInt("pref_flash_mode", CaptureRequest.CONTROL_AE_MODE_ON)
+        isVideoMode = sharedPrefs.getBoolean("pref_is_video_mode", false)
         
         val savedFilm = sharedPrefs.getString("pref_film_simulation", null)
         filmSimulation = if (savedFilm != null) {
@@ -215,10 +233,12 @@ class CameraFragment : Fragment() {
         updateModeToggleUI()
         updateFlashUI()
         updateAspectRatioUI()
+        updateMovieToggleUI()
         updateSettingsUI()
         setupLensSelector()
 
         fragmentCameraBinding.modeToggle?.setOnClickListener {
+            if (isVideoMode) return@setOnClickListener
             outputFormat = when (outputFormat) {
                 OutputFormat.RAW -> OutputFormat.JPEG
                 OutputFormat.JPEG -> OutputFormat.WEBP
@@ -235,7 +255,11 @@ class CameraFragment : Fragment() {
         }
 
         fragmentCameraBinding.aspectRatioToggle?.setOnClickListener {
-            isSquare = !isSquare
+            aspectRatio = when (aspectRatio) {
+                AspectRatio.RATIO_4_3 -> AspectRatio.RATIO_16_9
+                AspectRatio.RATIO_16_9 -> AspectRatio.RATIO_1_1
+                AspectRatio.RATIO_1_1 -> AspectRatio.RATIO_4_3
+            }
             updateAspectRatioUI()
             updateViewfinderRatio()
             updateSettingsUI()
@@ -269,6 +293,17 @@ class CameraFragment : Fragment() {
                 }
             } catch (exc: Exception) {
                 Log.e(TAG, "Failed to update flash mode on existing session, re-initializing", exc)
+                initializeCamera()
+            }
+        }
+
+        fragmentCameraBinding.movieToggle?.setOnClickListener {
+            if (isRecordingVideo) return@setOnClickListener
+            isVideoMode = !isVideoMode
+            updateSettingsUI()
+            updateCaptureButtonForState()
+            saveSettings()
+            if (!isShowingDone) {
                 initializeCamera()
             }
         }
@@ -314,6 +349,12 @@ class CameraFragment : Fragment() {
         fragmentCameraBinding.captureButton.setOnClickListener { button ->
             if (isShowingDone) {
                 hideProgress()
+            } else if (isVideoMode) {
+                if (isRecordingVideo) {
+                    stopRecordingVideo()
+                } else {
+                    startRecordingVideo()
+                }
             } else {
                 handleCaptureClick(button)
             }
@@ -355,7 +396,17 @@ class CameraFragment : Fragment() {
     }
 
     private fun updateModeToggleUI() {
-        fragmentCameraBinding.modeToggle?.text = outputFormat.name
+        val binding = _fragmentCameraBinding ?: return
+        if (isVideoMode) {
+            binding.modeToggle?.text = "MP4"
+            binding.modeToggle?.isEnabled = false
+            binding.modeToggle?.let { setButtonActiveStyle(it, false) }
+        } else {
+            binding.modeToggle?.text = outputFormat.name
+            val modeToggleAvailable = !isProcessing
+            binding.modeToggle?.isEnabled = modeToggleAvailable
+            binding.modeToggle?.let { setButtonActiveStyle(it, modeToggleAvailable) }
+        }
     }
 
     private fun updateFlashUI() {
@@ -369,9 +420,11 @@ class CameraFragment : Fragment() {
     }
 
     private fun updateAspectRatioUI() {
-        fragmentCameraBinding.aspectRatioToggle?.text = getString(
-            if (isSquare) R.string.aspect_ratio_square else R.string.aspect_ratio_full
-        )
+        fragmentCameraBinding.aspectRatioToggle?.text = when (aspectRatio) {
+            AspectRatio.RATIO_1_1 -> getString(R.string.aspect_ratio_square)
+            AspectRatio.RATIO_4_3 -> getString(R.string.aspect_ratio_full)
+            AspectRatio.RATIO_16_9 -> getString(R.string.aspect_ratio_16_9)
+        }
     }
 
     private var allCameraIds: List<String> = emptyList()
@@ -684,7 +737,6 @@ class CameraFragment : Fragment() {
         }
 
         setButtonActiveStyle(binding.aspectRatioToggle, true)
-        setButtonActiveStyle(binding.modeToggle, true)
 
         // The filter only takes effect on the RAW→Bitmap→JPEG conversion
         // path. In pure RAW (DNG) mode the saved file is just the sensor
@@ -702,12 +754,236 @@ class CameraFragment : Fragment() {
 
         updateAspectRatioUI()
         updateFlashUI()
+        updateMovieToggleUI()
         updateModeToggleUI()
         updateFilterUI()
     }
 
     private fun updateFilterUI() {
         fragmentCameraBinding.filterToggle?.text = filmSimulation.displayName
+    }
+
+    private fun updateMovieToggleUI() {
+        val binding = _fragmentCameraBinding ?: return
+        val iconRes = if (isVideoMode) {
+            R.drawable.ic_video
+        } else {
+            R.drawable.ic_camera
+        }
+        binding.movieToggle?.text = ""
+        binding.movieToggle?.setIconResource(iconRes)
+        val movieToggleEnabled = !isRecordingVideo && !isProcessing
+        binding.movieToggle?.isEnabled = movieToggleEnabled
+        binding.movieToggle?.let { setButtonActiveStyle(it, movieToggleEnabled) }
+    }
+
+    private fun chooseVideoSize(choices: Array<android.util.Size>): android.util.Size {
+        val targetRatio = when (aspectRatio) {
+            AspectRatio.RATIO_1_1 -> 1.0f
+            AspectRatio.RATIO_4_3 -> 4.0f / 3.0f
+            AspectRatio.RATIO_16_9 -> 16.0f / 9.0f
+        }
+        val tolerance = 0.05f
+        val matchingChoices = choices.filter {
+            val ratio = it.width.toFloat() / it.height.toFloat()
+            kotlin.math.abs(ratio - targetRatio) < tolerance || kotlin.math.abs((1f / ratio) - targetRatio) < tolerance
+        }
+        val sortedChoices = if (matchingChoices.isNotEmpty()) matchingChoices else choices.toList()
+        return sortedChoices.firstOrNull { it.width == 1920 && it.height == 1080 }
+            ?: sortedChoices.firstOrNull { it.width == 1440 && it.height == 1080 }
+            ?: sortedChoices.firstOrNull { it.width == 1280 && it.height == 720 }
+            ?: sortedChoices.maxByOrNull { it.width * it.height }
+            ?: choices.first()
+    }
+
+    private fun setupMediaRecorder(videoSize: android.util.Size, rotation: Int) {
+        val filename = "VID_${SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())}.mp4"
+        
+        mediaRecorder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            android.media.MediaRecorder(requireContext())
+        } else {
+            @Suppress("DEPRECATION")
+            android.media.MediaRecorder()
+        }
+
+        val resolver = requireContext().contentResolver
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            val contentValues = ContentValues().apply {
+                put(MediaStore.Video.Media.DISPLAY_NAME, filename)
+                put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
+                put(MediaStore.Video.Media.RELATIVE_PATH, "${Environment.DIRECTORY_DCIM}/Camera")
+            }
+            val uri = resolver.insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, contentValues)
+                ?: throw IOException("Failed to create MediaStore entry")
+            videoUri = uri
+            val pfd = resolver.openFileDescriptor(uri, "rw") ?: throw IOException("Failed to open file descriptor")
+            videoFileDescriptor = pfd
+            mediaRecorder?.setOutputFile(pfd.fileDescriptor)
+            
+            val dcim = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DCIM)
+            currentVideoFile = File(File(dcim, "Camera"), filename)
+        } else {
+            val dcim = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DCIM)
+            val dir = File(dcim, "Camera").apply { if (!exists()) mkdirs() }
+            val file = File(dir, filename)
+            currentVideoFile = file
+            mediaRecorder?.setOutputFile(file.absolutePath)
+        }
+
+        mediaRecorder?.apply {
+            setAudioSource(android.media.MediaRecorder.AudioSource.MIC)
+            setVideoSource(android.media.MediaRecorder.VideoSource.SURFACE)
+            setOutputFormat(android.media.MediaRecorder.OutputFormat.MPEG_4)
+            setVideoEncoder(android.media.MediaRecorder.VideoEncoder.H264)
+            setAudioEncoder(android.media.MediaRecorder.AudioEncoder.AAC)
+            setVideoSize(videoSize.width, videoSize.height)
+            setVideoFrameRate(30)
+            setVideoEncodingBitRate(10000000)
+            setAudioEncodingBitRate(96000)
+            setAudioChannels(1)
+            setAudioSamplingRate(44100)
+            setOrientationHint(rotation)
+            prepare()
+        }
+    }
+
+    private fun startRecordingVideo() {
+        if (!::session.isInitialized) return
+        
+        viewLifecycleOwner.lifecycleScope.launch {
+            try {
+                fragmentCameraBinding.captureButton.isEnabled = false
+                
+                val streamMap = characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+                    ?: throw RuntimeException("Stream configuration map not available")
+                val videoSizes = streamMap.getOutputSizes(android.media.MediaRecorder::class.java)
+                val videoSize = chooseVideoSize(videoSizes)
+                
+                val deviceCw = relativeOrientation.value ?: when (
+                    fragmentCameraBinding.viewFinder.display?.rotation ?: Surface.ROTATION_0
+                ) {
+                    Surface.ROTATION_0 -> 0
+                    Surface.ROTATION_90 -> 90
+                    Surface.ROTATION_180 -> 180
+                    Surface.ROTATION_270 -> 270
+                    else -> 0
+                }
+                val videoRotation = computeJpegOrientation(characteristics, deviceCw)
+                
+                setupMediaRecorder(videoSize, videoRotation)
+                
+                val recorderSurface = mediaRecorder?.surface ?: throw RuntimeException("Recorder surface is null")
+                
+                if (::session.isInitialized) {
+                    session.close()
+                }
+                
+                val targets = listOf(fragmentCameraBinding.viewFinder.holder.surface, recorderSurface)
+                val outputs = targets.map { surface ->
+                    val config = android.hardware.camera2.params.OutputConfiguration(surface)
+                    val logicalParent = physicalToLogicalMap[currentCameraId]
+                    if (logicalParent != null && logicalParent != currentCameraId) {
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                            config.setPhysicalCameraId(currentCameraId)
+                        }
+                    }
+                    config
+                }
+                
+                session = createCaptureSession(camera, outputs, cameraHandler)
+                
+                val captureRequest = camera.createCaptureRequest(CameraDevice.TEMPLATE_RECORD).apply {
+                    addTarget(fragmentCameraBinding.viewFinder.holder.surface)
+                    addTarget(recorderSurface)
+                    set(CaptureRequest.CONTROL_AE_MODE, flashMode)
+                }
+                session.setRepeatingRequest(captureRequest.build(), null, cameraHandler)
+                
+                mediaRecorder?.start()
+                isRecordingVideo = true
+                
+                updateCaptureButtonForState()
+                fragmentCameraBinding.captureButton.isEnabled = true
+                
+                fragmentCameraBinding.movieToggle?.isEnabled = false
+                fragmentCameraBinding.settingsToggle?.isEnabled = false
+                fragmentCameraBinding.galleryButton?.isEnabled = false
+                val lensContainer = fragmentCameraBinding.lensSelectorContainer
+                for (i in 0 until (lensContainer?.childCount ?: 0)) {
+                    lensContainer?.getChildAt(i)?.isEnabled = false
+                }
+            } catch (exc: Exception) {
+                Log.e(TAG, "Failed to start video recording", exc)
+                Toast.makeText(requireContext(), "Failed to start recording: ${exc.message}", Toast.LENGTH_SHORT).show()
+                initializeCamera()
+            }
+        }
+    }
+
+    private fun stopRecordingVideo() {
+        if (!isRecordingVideo) return
+        
+        viewLifecycleOwner.lifecycleScope.launch {
+            try {
+                _fragmentCameraBinding?.captureButton?.isEnabled = false
+                setProcessing(true)
+                
+                try {
+                    mediaRecorder?.stop()
+                    _fragmentCameraBinding?.viewFinder?.post(shutterFlashTask)
+                } catch (exc: RuntimeException) {
+                    Log.e(TAG, "RuntimeException stopping MediaRecorder: dynamic check, might be too short", exc)
+                    currentVideoFile?.delete()
+                }
+                mediaRecorder?.reset()
+                mediaRecorder?.release()
+                mediaRecorder = null
+                
+                videoFileDescriptor?.close()
+                videoFileDescriptor = null
+                
+                isRecordingVideo = false
+                updateCaptureButtonForState()
+                
+                val file = currentVideoFile
+                if (file != null && file.exists()) {
+                    withContext(Dispatchers.IO) {
+                        suspendCancellableCoroutine<Unit> { cont ->
+                            val context = context ?: return@suspendCancellableCoroutine
+                            android.media.MediaScannerConnection.scanFile(
+                                context,
+                                arrayOf(file.absolutePath),
+                                arrayOf("video/mp4")
+                            ) { _, _ ->
+                                if (cont.isActive) cont.resume(Unit)
+                            }
+                        }
+                    }
+                    context?.let { ctx ->
+                        Toast.makeText(ctx, "Video saved", Toast.LENGTH_SHORT).show()
+                    }
+                }
+                
+                // Add a small delay so the user clearly sees the "Developing..." state feedback
+                kotlinx.coroutines.delay(1000)
+            } catch (exc: Exception) {
+                Log.e(TAG, "Failed to stop video recording", exc)
+            } finally {
+                setProcessing(false)
+                updateCaptureButtonForState()
+                if (_fragmentCameraBinding != null) {
+                    reEnableUI()
+                }
+                
+                _fragmentCameraBinding?.movieToggle?.isEnabled = true
+                _fragmentCameraBinding?.settingsToggle?.isEnabled = true
+                _fragmentCameraBinding?.galleryButton?.isEnabled = true
+                
+                if (_fragmentCameraBinding != null && isAdded) {
+                    initializeCamera()
+                }
+            }
+        }
     }
 
     /** Flips [isProcessing] and refreshes the settings UI (which gates the
@@ -746,21 +1022,37 @@ class CameraFragment : Fragment() {
             val sensorOrientation = ch.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 0
             val streamMap = ch.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
             if (streamMap != null) {
-                val supportedSizes = streamMap.getOutputSizes(args.pixelFormat)
-                val format = if (supportedSizes.isNullOrEmpty()) ImageFormat.JPEG else args.pixelFormat
-                val finalSizes = if (format == args.pixelFormat) supportedSizes else streamMap.getOutputSizes(format)
-                val size = finalSizes?.maxByOrNull { it.height * it.width }
-                if (size != null) {
-                    val needsSwap = (sensorOrientation == 90 || sensorOrientation == 270)
-                    val displayWidth = if (needsSwap) size.height else size.width
-                    val displayHeight = if (needsSwap) size.width else size.height
-                    val ratio = if (isSquare) "1:1" else "$displayWidth:$displayHeight"
-
-                    val constraintSet = androidx.constraintlayout.widget.ConstraintSet()
-                    constraintSet.clone(fragmentCameraBinding.root as androidx.constraintlayout.widget.ConstraintLayout)
-                    constraintSet.setDimensionRatio(R.id.view_finder_container, ratio)
-                    constraintSet.applyTo(fragmentCameraBinding.root as androidx.constraintlayout.widget.ConstraintLayout)
+                val needsSwap = (sensorOrientation == 90 || sensorOrientation == 270)
+                val ratio = when (aspectRatio) {
+                    AspectRatio.RATIO_1_1 -> "1:1"
+                    AspectRatio.RATIO_16_9 -> if (needsSwap) "9:16" else "16:9"
+                    AspectRatio.RATIO_4_3 -> {
+                        if (isVideoMode) {
+                            val videoSizes = streamMap.getOutputSizes(android.media.MediaRecorder::class.java)
+                            val videoSize = chooseVideoSize(videoSizes)
+                            val displayWidth = if (needsSwap) videoSize.height else videoSize.width
+                            val displayHeight = if (needsSwap) videoSize.width else videoSize.height
+                            "$displayWidth:$displayHeight"
+                        } else {
+                            val supportedSizes = streamMap.getOutputSizes(args.pixelFormat)
+                            val format = if (supportedSizes.isNullOrEmpty()) ImageFormat.JPEG else args.pixelFormat
+                            val finalSizes = if (format == args.pixelFormat) supportedSizes else streamMap.getOutputSizes(format)
+                            val size = finalSizes?.maxByOrNull { it.height * it.width }
+                            if (size != null) {
+                                val displayWidth = if (needsSwap) size.height else size.width
+                                val displayHeight = if (needsSwap) size.width else size.height
+                                "$displayWidth:$displayHeight"
+                            } else {
+                                if (needsSwap) "3:4" else "4:3"
+                            }
+                        }
+                    }
                 }
+
+                val constraintSet = androidx.constraintlayout.widget.ConstraintSet()
+                constraintSet.clone(fragmentCameraBinding.root as androidx.constraintlayout.widget.ConstraintLayout)
+                constraintSet.setDimensionRatio(R.id.view_finder_container, ratio)
+                constraintSet.applyTo(fragmentCameraBinding.root as androidx.constraintlayout.widget.ConstraintLayout)
             }
         } catch (e: Exception) {
             Log.e(TAG, "Failed to update viewfinder ratio constraints", e)
@@ -821,7 +1113,7 @@ class CameraFragment : Fragment() {
                     thumbnail.setColorFilter(Color.argb(204, 0, 0, 0))
                     
                     // Adjust viewfinder container ratio to match the frozen thumbnail aspect ratio
-                    val ratio = if (isSquare) "1:1" else "${state.frozenBitmap.width}:${state.frozenBitmap.height}"
+                    val ratio = "${state.frozenBitmap.width}:${state.frozenBitmap.height}"
                     val constraintSet = androidx.constraintlayout.widget.ConstraintSet()
                     constraintSet.clone(binding.root as androidx.constraintlayout.widget.ConstraintLayout)
                     constraintSet.setDimensionRatio(R.id.view_finder_container, ratio)
@@ -851,7 +1143,7 @@ class CameraFragment : Fragment() {
                     thumbnail.visibility = View.VISIBLE
                     
                     // Adjust viewfinder container ratio to match the captured thumbnail aspect ratio
-                    val ratio = if (isSquare) "1:1" else "${state.thumbnail.width}:${state.thumbnail.height}"
+                    val ratio = "${state.thumbnail.width}:${state.thumbnail.height}"
                     val constraintSet = androidx.constraintlayout.widget.ConstraintSet()
                     constraintSet.clone(binding.root as androidx.constraintlayout.widget.ConstraintLayout)
                     constraintSet.setDimensionRatio(R.id.view_finder_container, ratio)
@@ -921,12 +1213,40 @@ class CameraFragment : Fragment() {
             when {
                 isShowingDone -> R.string.progress_take_new
                 isProcessing -> R.string.progress_developing
+                isRecordingVideo -> R.string.video_stop
+                isVideoMode -> R.string.video_record
                 else -> R.string.capture
             }
         )
     }
 
     private fun releaseResources() {
+        if (isRecordingVideo) {
+            try {
+                mediaRecorder?.stop()
+            } catch (exc: Throwable) {
+                Log.w(TAG, "mediaRecorder stop failed: ${exc.message}")
+            }
+            isRecordingVideo = false
+        }
+        try {
+            mediaRecorder?.reset()
+        } catch (exc: Throwable) {
+            Log.w(TAG, "mediaRecorder reset failed: ${exc.message}")
+        }
+        try {
+            mediaRecorder?.release()
+        } catch (exc: Throwable) {
+            Log.w(TAG, "mediaRecorder release failed: ${exc.message}")
+        }
+        mediaRecorder = null
+        try {
+            videoFileDescriptor?.close()
+        } catch (exc: Throwable) {
+            Log.w(TAG, "videoFileDescriptor close failed: ${exc.message}")
+        }
+        videoFileDescriptor = null
+
         // Close each resource independently so a failure in one doesn't skip the others.
         if (::session.isInitialized) {
             try { session.stopRepeating() } catch (exc: Throwable) {
@@ -1097,41 +1417,42 @@ class CameraFragment : Fragment() {
                 Log.d(TAG, "Initializing image reader")
                 val streamMap = characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
                     ?: throw RuntimeException("Camera $currentCameraId does not support stream configuration map")
-                
-                // Both "Save as RAW" and "Save as JPEG" capture RAW sensor data —
-                // that's the whole point of an "unprocess" app. JPEG mode just
-                // demosaics the RAW into a Bitmap and re-encodes as JPEG, without
-                // running the device's ISP (no denoising, sharpening, tone mapping,
-                // colour-profile bake-in). The HAL's direct JPEG output would be
-                // smaller/prettier but heavily processed — exactly what we want
-                // to avoid.
-                val supportedSizes = streamMap.getOutputSizes(args.pixelFormat)
-                val format = if (supportedSizes.isNullOrEmpty()) {
-                    Log.w(TAG, "Requested format ${args.pixelFormat} not supported by camera $currentCameraId, falling back to JPEG")
-                    ImageFormat.JPEG
+
+                val previewSize = if (isVideoMode) {
+                    val videoSizes = streamMap.getOutputSizes(android.media.MediaRecorder::class.java)
+                    val videoSize = chooseVideoSize(videoSizes)
+                    val captureRatio = videoSize.width.toFloat() / videoSize.height.toFloat()
+                    getPreviewOutputSize(
+                        fragmentCameraBinding.viewFinder.display,
+                        characteristics,
+                        SurfaceHolder::class.java,
+                        aspectRatio = captureRatio
+                    )
                 } else {
-                    args.pixelFormat
+                    val supportedSizes = streamMap.getOutputSizes(args.pixelFormat)
+                    val format = if (supportedSizes.isNullOrEmpty()) {
+                        Log.w(TAG, "Requested format ${args.pixelFormat} not supported by camera $currentCameraId, falling back to JPEG")
+                        ImageFormat.JPEG
+                    } else {
+                        args.pixelFormat
+                    }
+
+                    val finalSizes = if (format == args.pixelFormat) supportedSizes else streamMap.getOutputSizes(format)
+                    val size = finalSizes?.maxByOrNull { it.height * it.width }
+                        ?: throw RuntimeException("No supported sizes found for format $format on camera $currentCameraId")
+                    
+                    imageReader = ImageReader.newInstance(
+                        size.width, size.height, format, IMAGE_BUFFER_SIZE
+                    )
+
+                    val captureRatio = size.width.toFloat() / size.height.toFloat()
+                    getPreviewOutputSize(
+                        fragmentCameraBinding.viewFinder.display,
+                        characteristics,
+                        SurfaceHolder::class.java,
+                        aspectRatio = captureRatio
+                    )
                 }
-
-                val finalSizes = if (format == args.pixelFormat) supportedSizes else streamMap.getOutputSizes(format)
-                val size = finalSizes?.maxByOrNull { it.height * it.width }
-                    ?: throw RuntimeException("No supported sizes found for format $format on camera $currentCameraId")
-                Log.d(TAG, "Capture format=$format (outputFormat=$outputFormat), size=${size.width}x${size.height}")
-                
-                imageReader = ImageReader.newInstance(
-                    size.width, size.height, format, IMAGE_BUFFER_SIZE
-                )
-
-                // Pick a preview size capped at the display resolution to avoid
-                // wasting GPU bandwidth on full-sensor previews (often 4K+).
-                val captureRatio = size.width.toFloat() / size.height.toFloat()
-                val previewSize = getPreviewOutputSize(
-                    fragmentCameraBinding.viewFinder.display,
-                    characteristics,
-                    SurfaceHolder::class.java,
-                    aspectRatio = captureRatio
-                )
-                Log.d(TAG, "Capture: ${size.width}x${size.height} ratio=$captureRatio | preview: ${previewSize.width}x${previewSize.height}")
 
                 // Determine if sensor+device orientation requires swapping
                 // width/height for the on-screen aspect ratio.
@@ -1153,7 +1474,22 @@ class CameraFragment : Fragment() {
                 fragmentCameraBinding.viewFinder.setAspectRatio(displayWidth, displayHeight)
                 fragmentCameraBinding.viewFinder.setBufferSize(previewSize.width, previewSize.height)
 
-                val ratio = if (isSquare) "1:1" else "$displayWidth:$displayHeight"
+                val needsSwapRatio = (sensorOrientation == 90 || sensorOrientation == 270)
+                val ratio = when (aspectRatio) {
+                    AspectRatio.RATIO_1_1 -> "1:1"
+                    AspectRatio.RATIO_16_9 -> if (needsSwapRatio) "9:16" else "16:9"
+                    AspectRatio.RATIO_4_3 -> {
+                        if (isVideoMode) {
+                            val videoSizes = streamMap.getOutputSizes(android.media.MediaRecorder::class.java)
+                            val videoSize = chooseVideoSize(videoSizes)
+                            val displayWidthRatio = if (needsSwapRatio) videoSize.height else videoSize.width
+                            val displayHeightRatio = if (needsSwapRatio) videoSize.width else videoSize.height
+                            "$displayWidthRatio:$displayHeightRatio"
+                        } else {
+                            "$displayWidth:$displayHeight"
+                        }
+                    }
+                }
                 val facingFrontPreview = characteristics.get(CameraCharacteristics.LENS_FACING) ==
                         CameraCharacteristics.LENS_FACING_FRONT
                 Log.d(TAG, "PREVIEW DIAG | camera=$currentCameraId facing=${if (facingFrontPreview) "FRONT" else "BACK"} sensor=${sensorOrientation}° deviceDisplay=${deviceRotation}° swap=$needsSwap | buffer=${previewSize.width}x${previewSize.height} viewAspect=$displayWidth:$displayHeight container=$ratio")
@@ -1164,7 +1500,11 @@ class CameraFragment : Fragment() {
                 constraintSet.applyTo(fragmentCameraBinding.root as androidx.constraintlayout.widget.ConstraintLayout)
 
                 // Creates list of Surfaces where the camera will output frames
-                val targets = listOf(fragmentCameraBinding.viewFinder.holder.surface, imageReader.surface)
+                val targets = if (isVideoMode) {
+                    listOf(fragmentCameraBinding.viewFinder.holder.surface)
+                } else {
+                    listOf(fragmentCameraBinding.viewFinder.holder.surface, imageReader.surface)
+                }
 
                 // Creates list of OutputConfigurations where the camera will output frames
                 val outputs = targets.map { surface ->
@@ -1181,9 +1521,8 @@ class CameraFragment : Fragment() {
                 // Start a capture session using our open camera and list of OutputConfigurations
                 session = createCaptureSession(camera, outputs, cameraHandler)
 
-                val captureRequest = camera.createCaptureRequest(
-                    CameraDevice.TEMPLATE_PREVIEW
-                ).apply { 
+                val template = if (isVideoMode) CameraDevice.TEMPLATE_RECORD else CameraDevice.TEMPLATE_PREVIEW
+                val captureRequest = camera.createCaptureRequest(template).apply { 
                     addTarget(fragmentCameraBinding.viewFinder.holder.surface)
                     set(CaptureRequest.CONTROL_AE_MODE, flashMode)
                 }
@@ -1256,8 +1595,8 @@ class CameraFragment : Fragment() {
         viewLifecycleOwner.lifecycleScope.launch {
             // Capture a snapshot of the viewfinder to freeze it on screen
             val rawFrozen = captureSurfaceBitmap(fragmentCameraBinding.viewFinder)
-            val frozen = if (isSquare && rawFrozen != null) {
-                cropToSquare(rawFrozen).also {
+            val frozen = if (rawFrozen != null) {
+                cropToAspectRatio(rawFrozen).also {
                     if (it !== rawFrozen) rawFrozen.recycle()
                 }
             } else rawFrozen
@@ -1272,7 +1611,7 @@ class CameraFragment : Fragment() {
                         result.format == ImageFormat.RAW_SENSOR && (outputFormat == OutputFormat.JPEG || outputFormat == OutputFormat.WEBP) -> {
                             val bitmap = withContext(Dispatchers.IO) { rawToBitmap(result) }
                             try {
-                                val croppedBitmap = if (isSquare) cropToSquare(bitmap) else bitmap
+                                val croppedBitmap = cropToAspectRatio(bitmap)
                                 // Apply the selected film simulation. NORMAL is a
                                 // no-op and returns the same bitmap; otherwise the
                                 // result may be a new mutable bitmap.
@@ -1558,13 +1897,26 @@ class CameraFragment : Fragment() {
         return Bitmap.createScaledBitmap(source, w, h, true)
     }
 
-    private fun cropToSquare(bitmap: Bitmap): Bitmap {
+    private fun cropToAspectRatio(bitmap: Bitmap): Bitmap {
+        if (aspectRatio == AspectRatio.RATIO_4_3) return bitmap
+        val isPortrait = bitmap.height > bitmap.width
+        val (targetW, targetH) = when (aspectRatio) {
+            AspectRatio.RATIO_1_1 -> Pair(1, 1)
+            AspectRatio.RATIO_16_9 -> if (isPortrait) Pair(9, 16) else Pair(16, 9)
+            else -> Pair(bitmap.width, bitmap.height)
+        }
         val width = bitmap.width
         val height = bitmap.height
-        val minDim = minOf(width, height)
-        val x = (width - minDim) / 2
-        val y = (height - minDim) / 2
-        return Bitmap.createBitmap(bitmap, x, y, minDim, minDim)
+        
+        val targetHeight = (width * targetH) / targetW
+        return if (targetHeight <= height) {
+            val y = (height - targetHeight) / 2
+            Bitmap.createBitmap(bitmap, 0, y, width, targetHeight)
+        } else {
+            val targetWidth = (height * targetW) / targetH
+            val x = (width - targetWidth) / 2
+            Bitmap.createBitmap(bitmap, x, 0, targetWidth, height)
+        }
     }
 
     /**
@@ -1741,7 +2093,7 @@ class CameraFragment : Fragment() {
                             decoded, 0, 0, decoded.width, decoded.height, matrix, true,
                         ).also { r -> if (r !== decoded) decoded.recycle() }
                     } else decoded
-                    val finalBitmap = if (isSquare) cropToSquare(rotated) else rotated
+                    val finalBitmap = cropToAspectRatio(rotated)
                     val small = makeThumbnail(finalBitmap)
                     if (small !== finalBitmap) finalBitmap.recycle()
                     if (finalBitmap !== rotated) rotated.recycle()
@@ -1771,11 +2123,11 @@ class CameraFragment : Fragment() {
 
         // Decode-and-reencode path: needed whenever we have to crop to square
         // OR apply a film simulation OR user requested WEBP.
-        val needsDecode = isSquare || filmSimulation != FilmSimulation.NORMAL || outputFormat == OutputFormat.WEBP
+        val needsDecode = aspectRatio != AspectRatio.RATIO_4_3 || filmSimulation != FilmSimulation.NORMAL || outputFormat == OutputFormat.WEBP
         if (needsDecode) {
             val decoded = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
                 ?: throw IOException("Failed to decode JPEG bytes for processing")
-            val cropped = if (isSquare) cropToSquare(decoded) else decoded
+            val cropped = cropToAspectRatio(decoded)
             val processed = FilmFilter.apply(cropped, filmSimulation)
             try {
                 val file = if (outputFormat == OutputFormat.WEBP) {
@@ -1830,9 +2182,11 @@ class CameraFragment : Fragment() {
         val sharedPrefs = requireContext().getSharedPreferences("unprocess_settings", Context.MODE_PRIVATE)
         sharedPrefs.edit().apply {
             putString("pref_output_format", outputFormat.name)
-            putBoolean("pref_is_square", isSquare)
+            putString("pref_aspect_ratio", aspectRatio.name)
+            putBoolean("pref_is_square", aspectRatio == AspectRatio.RATIO_1_1)
             putInt("pref_flash_mode", flashMode)
             putString("pref_film_simulation", filmSimulation.name)
+            putBoolean("pref_is_video_mode", isVideoMode)
             apply()
         }
     }

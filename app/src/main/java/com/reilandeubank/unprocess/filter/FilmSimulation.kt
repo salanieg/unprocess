@@ -110,7 +110,7 @@ enum class FilmSimulation(val displayName: String, val params: FilmParams) {
     // Signature: warm amber, slightly green-yellow midtones, lifted shadows,
     // soft highlights, restrained greens & blues, fine-medium grain.
     GOLD(
-        displayName = "Gold",
+        displayName = "Film Gold",
         params = FilmParams(
             contrast = 6,
             highlights = -10,
@@ -157,7 +157,7 @@ enum class FilmSimulation(val displayName: String, val params: FilmParams) {
     // Signature: cool/neutral overall, green-cyan shadow cast, vibrant greens,
     // cyan-leaning blues, slightly muted skin warmth, visible grain.
     SUPER(
-        displayName = "Super",
+        displayName = "Film Super",
         params = FilmParams(
             contrast = 9,
             highlights = -10,
@@ -216,7 +216,7 @@ enum class FilmSimulation(val displayName: String, val params: FilmParams) {
     // leans on vibrance (which preserves already-saturated pixels) instead
     // of flat HSL saturation pumping.
     NECTAR(
-        displayName = "Nectar",
+        displayName = "Film Nectar",
         params = FilmParams(
             contrast = 8,                      // was 18 — main cause of crushing
             highlights = -8,
@@ -279,7 +279,7 @@ enum class FilmSimulation(val displayName: String, val params: FilmParams) {
     // ("Flächen verschwinden"). This version stays in a tonal range where
     // Clarity can do its job without artefacts.
     DYNA(
-        displayName = "Dyna",
+        displayName = "Film Dyna",
         params = FilmParams(
             // No global contrast change. Pro HDR modes don't push contrast —
             // they actually reduce it slightly to fit more range in.

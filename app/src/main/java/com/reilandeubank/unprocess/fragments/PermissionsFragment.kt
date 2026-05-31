@@ -31,7 +31,10 @@ import androidx.lifecycle.lifecycleScope
 import com.reilandeubank.unprocess.R
 
 private const val PERMISSIONS_REQUEST_CODE = 10
-private val PERMISSIONS_REQUIRED = arrayOf(Manifest.permission.CAMERA)
+private val PERMISSIONS_REQUIRED = arrayOf(
+    Manifest.permission.CAMERA,
+    Manifest.permission.RECORD_AUDIO
+)
 
 /**
  * This [Fragment] requests permissions and, once granted, it will navigate to the next fragment
@@ -54,7 +57,7 @@ class PermissionsFragment : Fragment() {
             requestCode: Int, permissions: Array<String>, grantResults: IntArray) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
         if (requestCode == PERMISSIONS_REQUEST_CODE) {
-            if (grantResults[0] == PackageManager.PERMISSION_GRANTED) {
+            if (grantResults.isNotEmpty() && grantResults.all { it == PackageManager.PERMISSION_GRANTED }) {
                 // Takes the user to the success fragment when permission is granted
                 navigateToCamera()
             } else {
