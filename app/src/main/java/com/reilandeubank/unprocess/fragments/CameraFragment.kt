@@ -821,7 +821,7 @@ class CameraFragment : Fragment() {
                     thumbnail.setColorFilter(Color.argb(204, 0, 0, 0))
                     
                     // Adjust viewfinder container ratio to match the frozen thumbnail aspect ratio
-                    val ratio = "${state.frozenBitmap.width}:${state.frozenBitmap.height}"
+                    val ratio = if (isSquare) "1:1" else "${state.frozenBitmap.width}:${state.frozenBitmap.height}"
                     val constraintSet = androidx.constraintlayout.widget.ConstraintSet()
                     constraintSet.clone(binding.root as androidx.constraintlayout.widget.ConstraintLayout)
                     constraintSet.setDimensionRatio(R.id.view_finder_container, ratio)
@@ -851,7 +851,7 @@ class CameraFragment : Fragment() {
                     thumbnail.visibility = View.VISIBLE
                     
                     // Adjust viewfinder container ratio to match the captured thumbnail aspect ratio
-                    val ratio = "${state.thumbnail.width}:${state.thumbnail.height}"
+                    val ratio = if (isSquare) "1:1" else "${state.thumbnail.width}:${state.thumbnail.height}"
                     val constraintSet = androidx.constraintlayout.widget.ConstraintSet()
                     constraintSet.clone(binding.root as androidx.constraintlayout.widget.ConstraintLayout)
                     constraintSet.setDimensionRatio(R.id.view_finder_container, ratio)
@@ -1255,7 +1255,12 @@ class CameraFragment : Fragment() {
 
         viewLifecycleOwner.lifecycleScope.launch {
             // Capture a snapshot of the viewfinder to freeze it on screen
-            val frozen = captureSurfaceBitmap(fragmentCameraBinding.viewFinder)
+            val rawFrozen = captureSurfaceBitmap(fragmentCameraBinding.viewFinder)
+            val frozen = if (isSquare && rawFrozen != null) {
+                cropToSquare(rawFrozen).also {
+                    if (it !== rawFrozen) rawFrozen.recycle()
+                }
+            } else rawFrozen
             showProgress(CaptureProgress.Saving(frozen))
             try {
                 val captured = withContext(Dispatchers.IO) { takePhoto() }
