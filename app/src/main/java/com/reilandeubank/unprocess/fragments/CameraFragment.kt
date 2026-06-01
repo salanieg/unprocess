@@ -160,6 +160,10 @@ class CameraFragment : Fragment() {
     private enum class AspectRatio { RATIO_1_1, RATIO_4_3, RATIO_16_9 }
     private var aspectRatio: AspectRatio = AspectRatio.RATIO_4_3
 
+    private enum class VideoResolution { UHD_4K, FHD_1080P, HD_720P }
+    private var videoResolution: VideoResolution = VideoResolution.FHD_1080P
+    private var videoFrameRate: Int = 30
+
     private var isSettingsMode = false
     private var isAnimatingSettings = false
 
@@ -217,6 +221,14 @@ class CameraFragment : Fragment() {
         }
         flashMode = sharedPrefs.getInt("pref_flash_mode", CaptureRequest.CONTROL_AE_MODE_ON)
         isVideoMode = sharedPrefs.getBoolean("pref_is_video_mode", false)
+        
+        videoFrameRate = sharedPrefs.getInt("pref_video_fps", 30)
+        val savedResName = sharedPrefs.getString("pref_video_resolution", VideoResolution.FHD_1080P.name)
+        videoResolution = try {
+            VideoResolution.valueOf(savedResName ?: VideoResolution.FHD_1080P.name)
+        } catch (e: Exception) {
+            VideoResolution.FHD_1080P
+        }
         
         val savedFilm = sharedPrefs.getString("pref_film_simulation", null)
         val loadedFilm = if (savedFilm != null) {
@@ -288,6 +300,34 @@ class CameraFragment : Fragment() {
             }
         }
 
+        fragmentCameraBinding.resolutionToggle?.setOnClickListener {
+            if (isRecordingVideo || isProcessing || !isVideoMode) return@setOnClickListener
+            val supported = getSupportedVideoResolutions()
+            if (supported.isNotEmpty()) {
+                val nextIndex = (supported.indexOf(videoResolution) + 1) % supported.size
+                videoResolution = supported[nextIndex]
+                updateSettingsUI()
+                saveSettings()
+                if (!isShowingDone) {
+                    initializeCamera()
+                }
+            }
+        }
+
+        fragmentCameraBinding.framerateToggle?.setOnClickListener {
+            if (isRecordingVideo || isProcessing || !isVideoMode) return@setOnClickListener
+            val supported = getSupportedVideoFramerates()
+            if (supported.isNotEmpty()) {
+                val nextIndex = (supported.indexOf(videoFrameRate) + 1) % supported.size
+                videoFrameRate = supported[nextIndex]
+                updateSettingsUI()
+                saveSettings()
+                if (!isShowingDone) {
+                    initializeCamera()
+                }
+            }
+        }
+
         fragmentCameraBinding.flashToggle?.setOnClickListener {
             flashMode = if (flashMode == CaptureRequest.CONTROL_AE_MODE_ON_ALWAYS_FLASH) {
                 CaptureRequest.CONTROL_AE_MODE_ON
@@ -308,17 +348,7 @@ class CameraFragment : Fragment() {
                             addTarget(persistentSurface!!)
                         }
                         
-                        if (isVideoMode) {
-                            if (flashMode == CaptureRequest.CONTROL_AE_MODE_ON_ALWAYS_FLASH) {
-                                set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
-                                set(CaptureRequest.FLASH_MODE, CaptureRequest.FLASH_MODE_TORCH)
-                            } else {
-                                set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
-                                set(CaptureRequest.FLASH_MODE, CaptureRequest.FLASH_MODE_OFF)
-                            }
-                        } else {
-                            set(CaptureRequest.CONTROL_AE_MODE, flashMode)
-                        }
+                        applyCaptureRequestSettings(this)
                     }
                     session.setRepeatingRequest(captureRequest.build(), null, cameraHandler)
                 } else {
@@ -671,9 +701,20 @@ class CameraFragment : Fragment() {
         
         val toggles = listOfNotNull(
             binding.aspectRatioToggle,
+            binding.resolutionToggle,
+            binding.framerateToggle,
             binding.modeToggle,
             binding.filterToggle
-        )
+        ).filter { it.visibility == View.VISIBLE }
+        
+        if (toggles.isEmpty()) {
+            isAnimatingSettings = false
+            if (!open) {
+                panel.visibility = View.GONE
+                overlay.visibility = View.GONE
+            }
+            return
+        }
         
         isAnimatingSettings = true
         
@@ -693,7 +734,7 @@ class CameraFragment : Fragment() {
                 
             panel.visibility = View.VISIBLE
             
-            val offset = (-20).dpToPx().toFloat()
+            val offset = (-8).dpToPx().toFloat()
             toggles.forEachIndexed { index, button ->
                 button.alpha = 0f
                 button.scaleX = 0.3f
@@ -732,7 +773,7 @@ class CameraFragment : Fragment() {
                 })
                 .start()
                 
-            val offset = (-20).dpToPx().toFloat()
+            val offset = (-8).dpToPx().toFloat()
             val reversedToggles = toggles.reversed()
             reversedToggles.forEachIndexed { index, button ->
                 button.animate()
@@ -772,6 +813,17 @@ class CameraFragment : Fragment() {
         // Flash toggle is always visible and always active
         binding.flashToggle?.visibility = View.VISIBLE
         setButtonActiveStyle(binding.flashToggle, true)
+
+        // Update selector visibilities based on Video Mode
+        if (isVideoMode) {
+            binding.modeToggle?.visibility = View.GONE
+            binding.resolutionToggle?.visibility = View.VISIBLE
+            binding.framerateToggle?.visibility = View.VISIBLE
+        } else {
+            binding.modeToggle?.visibility = View.VISIBLE
+            binding.resolutionToggle?.visibility = View.GONE
+            binding.framerateToggle?.visibility = View.GONE
+        }
         
         if (!isAnimatingSettings) {
             binding.settingsPanel?.visibility = if (isSettingsMode) View.VISIBLE else View.GONE
@@ -780,6 +832,8 @@ class CameraFragment : Fragment() {
             if (isSettingsMode) {
                 listOfNotNull(
                     binding.aspectRatioToggle,
+                    binding.resolutionToggle,
+                    binding.framerateToggle,
                     binding.modeToggle,
                     binding.filterToggle
                 ).forEach { button ->
@@ -794,6 +848,13 @@ class CameraFragment : Fragment() {
         val aspectAvailable = !isProcessing && !isRecordingVideo
         binding.aspectRatioToggle?.isEnabled = aspectAvailable
         setButtonActiveStyle(binding.aspectRatioToggle, aspectAvailable)
+
+        val videoSettingsAvailable = !isProcessing && !isRecordingVideo && isVideoMode
+        binding.resolutionToggle?.isEnabled = videoSettingsAvailable
+        setButtonActiveStyle(binding.resolutionToggle, videoSettingsAvailable)
+        
+        binding.framerateToggle?.isEnabled = videoSettingsAvailable
+        setButtonActiveStyle(binding.framerateToggle, videoSettingsAvailable)
 
         // The filter only takes effect on the RAW→Bitmap→JPEG conversion
         // path. In pure RAW (DNG) mode the saved file is just the sensor
@@ -810,6 +871,16 @@ class CameraFragment : Fragment() {
         val filterAvailable = !isProcessing && !isRecordingVideo && !isVideoMode && (outputFormat == OutputFormat.JPEG || outputFormat == OutputFormat.WEBP)
         setButtonActiveStyle(binding.filterToggle, filterAvailable)
         binding.filterToggle?.isEnabled = filterAvailable
+
+        // Update resolution toggle text
+        binding.resolutionToggle?.text = when (videoResolution) {
+            VideoResolution.UHD_4K -> "4K"
+            VideoResolution.FHD_1080P -> "1080p"
+            VideoResolution.HD_720P -> "720p"
+        }
+        
+        // Update framerate toggle text
+        binding.framerateToggle?.text = "${videoFrameRate} FPS"
 
         updateAspectRatioUI()
         updateFlashUI()
@@ -836,6 +907,76 @@ class CameraFragment : Fragment() {
         binding.movieToggle?.let { setButtonActiveStyle(it, movieToggleEnabled) }
     }
 
+    private fun getSupportedVideoResolutions(): List<VideoResolution> {
+        val streamMap = characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP) ?: return listOf(VideoResolution.FHD_1080P)
+        val choices = streamMap.getOutputSizes(android.media.MediaRecorder::class.java) ?: return listOf(VideoResolution.FHD_1080P)
+        val targetRatio = when (aspectRatio) {
+            AspectRatio.RATIO_1_1 -> 1.0f
+            AspectRatio.RATIO_4_3 -> 4.0f / 3.0f
+            AspectRatio.RATIO_16_9 -> 16.0f / 9.0f
+        }
+        val tolerance = 0.05f
+        val matchingChoices = choices.filter {
+            val ratio = it.width.toFloat() / it.height.toFloat()
+            kotlin.math.abs(ratio - targetRatio) < tolerance || kotlin.math.abs((1f / ratio) - targetRatio) < tolerance
+        }
+        val sortedChoices = if (matchingChoices.isNotEmpty()) matchingChoices else choices.toList()
+        
+        val supported = mutableListOf<VideoResolution>()
+        if (sortedChoices.any { it.width == 2160 || it.height == 2160 }) {
+            supported.add(VideoResolution.UHD_4K)
+        }
+        if (sortedChoices.any { it.width == 1080 || it.height == 1080 }) {
+            supported.add(VideoResolution.FHD_1080P)
+        }
+        if (sortedChoices.any { it.width == 720 || it.height == 720 }) {
+            supported.add(VideoResolution.HD_720P)
+        }
+        
+        return if (supported.isEmpty()) listOf(VideoResolution.FHD_1080P) else supported
+    }
+
+    private fun getSupportedVideoFramerates(): List<Int> {
+        val fpsRanges = characteristics.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES) ?: return listOf(30)
+        val supported = mutableListOf<Int>()
+        if (fpsRanges.any { it.upper >= 60 }) {
+            supported.add(60)
+        }
+        supported.add(30)
+        return supported.distinct().sorted()
+    }
+
+    private fun chooseFpsRange(): android.util.Range<Int>? {
+        val fpsRanges = characteristics.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES) ?: return null
+        val target = videoFrameRate
+        
+        var bestRange = fpsRanges.filter { it.upper == target }
+            .maxByOrNull { it.lower }
+            
+        if (bestRange == null) {
+            bestRange = fpsRanges.minByOrNull { kotlin.math.abs(it.upper - target) }
+        }
+        return bestRange
+    }
+
+    private fun applyCaptureRequestSettings(builder: CaptureRequest.Builder) {
+        if (isVideoMode) {
+            if (flashMode == CaptureRequest.CONTROL_AE_MODE_ON_ALWAYS_FLASH) {
+                builder.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
+                builder.set(CaptureRequest.FLASH_MODE, CaptureRequest.FLASH_MODE_TORCH)
+            } else {
+                builder.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
+                builder.set(CaptureRequest.FLASH_MODE, CaptureRequest.FLASH_MODE_OFF)
+            }
+            val fpsRange = chooseFpsRange()
+            if (fpsRange != null) {
+                builder.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, fpsRange)
+            }
+        } else {
+            builder.set(CaptureRequest.CONTROL_AE_MODE, flashMode)
+        }
+    }
+
     private fun chooseVideoSize(choices: Array<android.util.Size>): android.util.Size {
         val targetRatio = when (aspectRatio) {
             AspectRatio.RATIO_1_1 -> 1.0f
@@ -848,6 +989,33 @@ class CameraFragment : Fragment() {
             kotlin.math.abs(ratio - targetRatio) < tolerance || kotlin.math.abs((1f / ratio) - targetRatio) < tolerance
         }
         val sortedChoices = if (matchingChoices.isNotEmpty()) matchingChoices else choices.toList()
+        
+        val targetHeight = when (videoResolution) {
+            VideoResolution.UHD_4K -> 2160
+            VideoResolution.FHD_1080P -> 1080
+            VideoResolution.HD_720P -> 720
+        }
+        
+        val matchingResolutionChoices = sortedChoices.filter {
+            it.width == targetHeight || it.height == targetHeight
+        }
+        
+        if (matchingResolutionChoices.isNotEmpty()) {
+            return matchingResolutionChoices.maxByOrNull { it.width * it.height }!!
+        }
+        
+        val fallbacks = when (videoResolution) {
+            VideoResolution.UHD_4K -> listOf(1080, 720)
+            VideoResolution.FHD_1080P -> listOf(720, 1080)
+            VideoResolution.HD_720P -> listOf(1080, 2160)
+        }
+        for (h in fallbacks) {
+            val fbChoices = sortedChoices.filter { it.width == h || it.height == h }
+            if (fbChoices.isNotEmpty()) {
+                return fbChoices.maxByOrNull { it.width * it.height }!!
+            }
+        }
+        
         return sortedChoices.firstOrNull { it.width == 1920 && it.height == 1080 }
             ?: sortedChoices.firstOrNull { it.width == 1440 && it.height == 1080 }
             ?: sortedChoices.firstOrNull { it.width == 1280 && it.height == 720 }
@@ -916,8 +1084,9 @@ class CameraFragment : Fragment() {
             setVideoEncoder(android.media.MediaRecorder.VideoEncoder.H264)
             setAudioEncoder(android.media.MediaRecorder.AudioEncoder.AAC)
             setVideoSize(videoSize.width, videoSize.height)
-            setVideoFrameRate(30)
-            setVideoEncodingBitRate(10000000)
+            setVideoFrameRate(videoFrameRate)
+            val bitrate = if (videoResolution == VideoResolution.UHD_4K) 20000000 else 10000000
+            setVideoEncodingBitRate(bitrate)
             setAudioEncodingBitRate(96000)
             setAudioChannels(1)
             setAudioSamplingRate(44100)
@@ -955,13 +1124,7 @@ class CameraFragment : Fragment() {
                 val captureRequest = camera.createCaptureRequest(CameraDevice.TEMPLATE_RECORD).apply {
                     addTarget(fragmentCameraBinding.viewFinder.holder.surface)
                     addTarget(persistentSurface!!)
-                    if (flashMode == CaptureRequest.CONTROL_AE_MODE_ON_ALWAYS_FLASH) {
-                        set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
-                        set(CaptureRequest.FLASH_MODE, CaptureRequest.FLASH_MODE_TORCH)
-                    } else {
-                        set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
-                        set(CaptureRequest.FLASH_MODE, CaptureRequest.FLASH_MODE_OFF)
-                    }
+                    applyCaptureRequestSettings(this)
                 }
                 session.setRepeatingRequest(captureRequest.build(), null, cameraHandler)
                 
@@ -1054,8 +1217,7 @@ class CameraFragment : Fragment() {
                     if (::session.isInitialized && _fragmentCameraBinding != null) {
                         val captureRequest = camera.createCaptureRequest(CameraDevice.TEMPLATE_RECORD).apply {
                             addTarget(_fragmentCameraBinding!!.viewFinder.holder.surface)
-                            set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
-                            set(CaptureRequest.FLASH_MODE, CaptureRequest.FLASH_MODE_OFF)
+                            applyCaptureRequestSettings(this)
                         }
                         session.setRepeatingRequest(captureRequest.build(), null, cameraHandler)
                     }
@@ -1800,17 +1962,7 @@ class CameraFragment : Fragment() {
                         addTarget(persistentSurface!!)
                     }
                     
-                    if (isVideoMode) {
-                        if (flashMode == CaptureRequest.CONTROL_AE_MODE_ON_ALWAYS_FLASH) {
-                            set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
-                            set(CaptureRequest.FLASH_MODE, CaptureRequest.FLASH_MODE_TORCH)
-                        } else {
-                            set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
-                            set(CaptureRequest.FLASH_MODE, CaptureRequest.FLASH_MODE_OFF)
-                        }
-                    } else {
-                        set(CaptureRequest.CONTROL_AE_MODE, flashMode)
-                    }
+                    applyCaptureRequestSettings(this)
                 }
 
                 // This will keep sending the capture request as frequently as possible until the
@@ -2479,6 +2631,8 @@ class CameraFragment : Fragment() {
             putInt("pref_flash_mode", flashMode)
             putString("pref_film_simulation", filmSimulation.name)
             putBoolean("pref_is_video_mode", isVideoMode)
+            putInt("pref_video_fps", videoFrameRate)
+            putString("pref_video_resolution", videoResolution.name)
             apply()
         }
     }
