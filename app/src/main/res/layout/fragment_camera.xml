@@ -73,6 +73,13 @@
             android:focusable="true"
             android:visibility="gone">
 
+            <VideoView
+                android:id="@+id/capture_progress_video"
+                android:layout_width="match_parent"
+                android:layout_height="match_parent"
+                android:layout_gravity="center"
+                android:visibility="gone" />
+
             <ImageView
                 android:id="@+id/capture_progress_thumbnail"
                 android:layout_width="match_parent"
@@ -80,6 +87,19 @@
                 android:contentDescription="@string/progress_thumbnail_desc"
                 android:scaleType="fitCenter"
                 android:visibility="gone" />
+
+            <com.google.android.material.floatingactionbutton.FloatingActionButton
+                android:id="@+id/capture_progress_play_button"
+                android:layout_width="72dp"
+                android:layout_height="72dp"
+                android:layout_gravity="center"
+                app:srcCompat="@drawable/ic_play"
+                app:tint="@android:color/black"
+                app:backgroundTint="?attr/colorPrimary"
+                app:fabCustomSize="72dp"
+                app:maxImageSize="36dp"
+                android:visibility="gone"
+                android:contentDescription="Play preview video" />
 
         </FrameLayout>
 

@@ -278,7 +278,9 @@ class CameraFragment : Fragment() {
                 AspectRatio.RATIO_1_1 -> AspectRatio.RATIO_4_3
             }
             updateAspectRatioUI()
-            updateViewfinderRatio()
+            if (!isShowingDone) {
+                updateViewfinderRatio()
+            }
             updateSettingsUI()
             saveSettings()
             if (!isShowingDone) {
@@ -649,6 +651,7 @@ class CameraFragment : Fragment() {
     }
 
     fun triggerCapture() {
+        if (isShowingDone) return
         val button = _fragmentCameraBinding?.captureButton ?: return
         if (button.isEnabled) {
             button.performClick()
@@ -1072,6 +1075,7 @@ class CameraFragment : Fragment() {
                 isRecordingVideo = false
                 updateCaptureButtonForState()
                 
+                var thumbnail: Bitmap? = null
                 val file = currentVideoFile
                 if (file != null && file.exists()) {
                     withContext(Dispatchers.IO) {
@@ -1086,10 +1090,32 @@ class CameraFragment : Fragment() {
                             }
                         }
                     }
+                    thumbnail = try {
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                            android.media.ThumbnailUtils.createVideoThumbnail(
+                                file,
+                                android.util.Size(960, 1280),
+                                null
+                            )
+                        } else {
+                            @Suppress("DEPRECATION")
+                            android.media.ThumbnailUtils.createVideoThumbnail(
+                                file.absolutePath,
+                                android.provider.MediaStore.Video.Thumbnails.MINI_KIND
+                            )
+                        }
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Failed to create video thumbnail", e)
+                        null
+                    }
                 }
                 
                 // Add a small delay so the user clearly sees the "Developing..." state feedback
                 kotlinx.coroutines.delay(1000)
+
+                if (thumbnail != null) {
+                    showProgress(CaptureProgress.Done(thumbnail))
+                }
             } catch (exc: Exception) {
                 Log.e(TAG, "Failed to stop video recording", exc)
             } finally {
@@ -1308,6 +1334,28 @@ class CameraFragment : Fragment() {
                 frozenThumbnail?.takeIf { !it.isRecycled }?.recycle()
                 frozenThumbnail = null
                 
+                if (isVideoMode) {
+                    binding.captureProgressPlayButton?.visibility = View.VISIBLE
+                    binding.captureProgressPlayButton?.setOnClickListener {
+                        binding.captureProgressPlayButton.visibility = View.GONE
+                        binding.captureProgressThumbnail?.visibility = View.GONE
+                        binding.captureProgressVideo?.apply {
+                            visibility = View.VISIBLE
+                            currentVideoFile?.let { file ->
+                                setVideoPath(file.absolutePath)
+                                start()
+                            }
+                        }
+                    }
+                    binding.captureProgressVideo?.setOnCompletionListener {
+                        binding.captureProgressVideo.visibility = View.GONE
+                        binding.captureProgressThumbnail?.visibility = View.VISIBLE
+                        binding.captureProgressPlayButton.visibility = View.VISIBLE
+                    }
+                } else {
+                    binding.captureProgressPlayButton?.visibility = View.GONE
+                }
+
                 isShowingDone = true
                 updateCaptureButtonForState()
             }
@@ -1326,12 +1374,12 @@ class CameraFragment : Fragment() {
         val binding = _fragmentCameraBinding ?: return
         val overlay = binding.captureProgressOverlay ?: return
         val thumbnail = binding.captureProgressThumbnail ?: return
-
+ 
         // Restore lens selector card visibility if camera entries exist
         if (allCameraIds.isNotEmpty()) {
             binding.lensSelectorCard?.visibility = View.VISIBLE
         }
-
+ 
         overlay.animate().cancel()
         overlay.visibility = View.GONE
         overlay.alpha = 1f
@@ -1339,6 +1387,15 @@ class CameraFragment : Fragment() {
         thumbnail.setImageDrawable(null)
         thumbnail.alpha = 1.0f
         thumbnail.clearColorFilter()
+        
+        binding.captureProgressVideo?.apply {
+            if (isPlaying) {
+                stopPlayback()
+            }
+            visibility = View.GONE
+        }
+        binding.captureProgressPlayButton?.visibility = View.GONE
+
         doneThumbnail?.takeIf { !it.isRecycled }?.recycle()
         doneThumbnail = null
         frozenThumbnail?.takeIf { !it.isRecycled }?.recycle()
@@ -1558,7 +1615,9 @@ class CameraFragment : Fragment() {
         
         // Disable UI during initialization (lens buttons too, so the user can't
         // bounce between lenses faster than the camera service can re-open).
-        fragmentCameraBinding.captureButton.isEnabled = false
+        if (!isRecordingVideo) {
+            fragmentCameraBinding.captureButton.isEnabled = false
+        }
         val lensContainer = fragmentCameraBinding.lensSelectorContainer
         for (i in 0 until (lensContainer?.childCount ?: 0)) {
             lensContainer?.getChildAt(i)?.isEnabled = false
