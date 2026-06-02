@@ -159,13 +159,16 @@ class CameraFragment : Fragment() {
     private var flashMode: Int = CaptureRequest.CONTROL_AE_MODE_ON
     private enum class AspectRatio { RATIO_1_1, RATIO_4_3, RATIO_16_9 }
     private var aspectRatio: AspectRatio = AspectRatio.RATIO_4_3
+    private var photoAspectRatio: AspectRatio = AspectRatio.RATIO_4_3
+    private var videoAspectRatio: AspectRatio = AspectRatio.RATIO_4_3
 
-    private enum class VideoResolution { UHD_4K, FHD_1080P, HD_720P }
-    private var videoResolution: VideoResolution = VideoResolution.FHD_1080P
+    private enum class VideoResolution { MAX, QHD_1440P, FHD_1080P, SD_480P }
+    private var videoResolution: VideoResolution = VideoResolution.MAX
     private var videoFrameRate: Int = 30
 
     private var isSettingsMode = false
     private var isAnimatingSettings = false
+    private var isCameraInitializing = false
 
     private var isVideoMode: Boolean = false
     private var isRecordingVideo: Boolean = false
@@ -209,9 +212,9 @@ class CameraFragment : Fragment() {
                 else -> OutputFormat.JPEG
             }
         }
-        val savedRatio = sharedPrefs.getString("pref_aspect_ratio", AspectRatio.RATIO_4_3.name)
-        aspectRatio = try {
-            AspectRatio.valueOf(savedRatio ?: AspectRatio.RATIO_4_3.name)
+        val savedPhotoRatio = sharedPrefs.getString("pref_photo_aspect_ratio", AspectRatio.RATIO_4_3.name)
+        photoAspectRatio = try {
+            AspectRatio.valueOf(savedPhotoRatio ?: AspectRatio.RATIO_4_3.name)
         } catch (e: Exception) {
             if (sharedPrefs.getBoolean("pref_is_square", false)) {
                 AspectRatio.RATIO_1_1
@@ -219,15 +222,24 @@ class CameraFragment : Fragment() {
                 AspectRatio.RATIO_4_3
             }
         }
+
+        val savedVideoRatio = sharedPrefs.getString("pref_video_aspect_ratio", AspectRatio.RATIO_4_3.name)
+        videoAspectRatio = try {
+            AspectRatio.valueOf(savedVideoRatio ?: AspectRatio.RATIO_4_3.name)
+        } catch (e: Exception) {
+            AspectRatio.RATIO_4_3
+        }
+
+        aspectRatio = if (isVideoMode) videoAspectRatio else photoAspectRatio
         flashMode = sharedPrefs.getInt("pref_flash_mode", CaptureRequest.CONTROL_AE_MODE_ON)
         isVideoMode = sharedPrefs.getBoolean("pref_is_video_mode", false)
         
         videoFrameRate = sharedPrefs.getInt("pref_video_fps", 30)
-        val savedResName = sharedPrefs.getString("pref_video_resolution", VideoResolution.FHD_1080P.name)
+        val savedResName = sharedPrefs.getString("pref_video_resolution", VideoResolution.MAX.name)
         videoResolution = try {
-            VideoResolution.valueOf(savedResName ?: VideoResolution.FHD_1080P.name)
+            VideoResolution.valueOf(savedResName ?: VideoResolution.MAX.name)
         } catch (e: Exception) {
-            VideoResolution.FHD_1080P
+            VideoResolution.MAX
         }
         
         val savedFilm = sharedPrefs.getString("pref_film_simulation", null)
@@ -285,19 +297,21 @@ class CameraFragment : Fragment() {
         fragmentCameraBinding.aspectRatioToggle?.setOnClickListener {
             if (isRecordingVideo || isProcessing) return@setOnClickListener
             aspectRatio = when (aspectRatio) {
-                AspectRatio.RATIO_4_3 -> AspectRatio.RATIO_16_9
-                AspectRatio.RATIO_16_9 -> AspectRatio.RATIO_1_1
-                AspectRatio.RATIO_1_1 -> AspectRatio.RATIO_4_3
+                AspectRatio.RATIO_4_3 -> AspectRatio.RATIO_1_1
+                AspectRatio.RATIO_1_1 -> AspectRatio.RATIO_16_9
+                AspectRatio.RATIO_16_9 -> AspectRatio.RATIO_4_3
+            }
+            if (isVideoMode) {
+                videoAspectRatio = aspectRatio
+            } else {
+                photoAspectRatio = aspectRatio
             }
             updateAspectRatioUI()
             if (!isShowingDone) {
                 updateViewfinderRatio()
-            }
-            updateSettingsUI()
-            saveSettings()
-            if (!isShowingDone) {
                 initializeCamera()
             }
+            saveSettings()
         }
 
         fragmentCameraBinding.resolutionToggle?.setOnClickListener {
@@ -368,8 +382,10 @@ class CameraFragment : Fragment() {
             if (isVideoMode) {
                 savedPhotoFilmSimulation = filmSimulation
                 filmSimulation = FilmSimulation.NORMAL
+                aspectRatio = videoAspectRatio
             } else {
                 filmSimulation = savedPhotoFilmSimulation
+                aspectRatio = photoAspectRatio
             }
             updateSettingsUI()
             updateCaptureButtonForState()
@@ -428,6 +444,7 @@ class CameraFragment : Fragment() {
         // The button stays disabled while a save is in flight; the handler
         // defensively checks the session before doing any work.
         fragmentCameraBinding.captureButton.setOnClickListener { button ->
+            if (isCameraInitializing) return@setOnClickListener
             if (isShowingDone) {
                 hideProgress()
             } else if (isVideoMode) {
@@ -874,9 +891,10 @@ class CameraFragment : Fragment() {
 
         // Update resolution toggle text
         binding.resolutionToggle?.text = when (videoResolution) {
-            VideoResolution.UHD_4K -> "4K"
+            VideoResolution.MAX -> "${getMaxResolutionHeight()}p"
+            VideoResolution.QHD_1440P -> "1440p"
             VideoResolution.FHD_1080P -> "1080p"
-            VideoResolution.HD_720P -> "720p"
+            VideoResolution.SD_480P -> "480p"
         }
         
         // Update framerate toggle text
@@ -907,9 +925,9 @@ class CameraFragment : Fragment() {
         binding.movieToggle?.let { setButtonActiveStyle(it, movieToggleEnabled) }
     }
 
-    private fun getSupportedVideoResolutions(): List<VideoResolution> {
-        val streamMap = characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP) ?: return listOf(VideoResolution.FHD_1080P)
-        val choices = streamMap.getOutputSizes(android.media.MediaRecorder::class.java) ?: return listOf(VideoResolution.FHD_1080P)
+    private fun getMaxResolutionHeight(): Int {
+        val streamMap = characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP) ?: return 1080
+        val choices = streamMap.getOutputSizes(android.media.MediaRecorder::class.java) ?: return 1080
         val targetRatio = when (aspectRatio) {
             AspectRatio.RATIO_1_1 -> 1.0f
             AspectRatio.RATIO_4_3 -> 4.0f / 3.0f
@@ -921,29 +939,42 @@ class CameraFragment : Fragment() {
             kotlin.math.abs(ratio - targetRatio) < tolerance || kotlin.math.abs((1f / ratio) - targetRatio) < tolerance
         }
         val sortedChoices = if (matchingChoices.isNotEmpty()) matchingChoices else choices.toList()
-        
+        val maxSize = sortedChoices.maxByOrNull { it.width * it.height } ?: return 1080
+        return maxSize.height
+    }
+
+    private fun getSupportedVideoResolutions(): List<VideoResolution> {
+        val maxHeight = getMaxResolutionHeight()
         val supported = mutableListOf<VideoResolution>()
-        if (sortedChoices.any { it.width == 2160 || it.height == 2160 }) {
-            supported.add(VideoResolution.UHD_4K)
-        }
-        if (sortedChoices.any { it.width == 1080 || it.height == 1080 }) {
+        
+        if (maxHeight > 1440) {
+            supported.add(VideoResolution.MAX)
+            supported.add(VideoResolution.QHD_1440P)
             supported.add(VideoResolution.FHD_1080P)
-        }
-        if (sortedChoices.any { it.width == 720 || it.height == 720 }) {
-            supported.add(VideoResolution.HD_720P)
+            supported.add(VideoResolution.SD_480P)
+        } else if (maxHeight == 1440) {
+            supported.add(VideoResolution.QHD_1440P)
+            supported.add(VideoResolution.FHD_1080P)
+            supported.add(VideoResolution.SD_480P)
+        } else if (maxHeight > 1080) {
+            supported.add(VideoResolution.MAX)
+            supported.add(VideoResolution.FHD_1080P)
+            supported.add(VideoResolution.SD_480P)
+        } else if (maxHeight == 1080) {
+            supported.add(VideoResolution.FHD_1080P)
+            supported.add(VideoResolution.SD_480P)
+        } else if (maxHeight > 480) {
+            supported.add(VideoResolution.MAX)
+            supported.add(VideoResolution.SD_480P)
+        } else { // maxHeight <= 480
+            supported.add(VideoResolution.SD_480P)
         }
         
-        return if (supported.isEmpty()) listOf(VideoResolution.FHD_1080P) else supported
+        return supported.distinct()
     }
 
     private fun getSupportedVideoFramerates(): List<Int> {
-        val fpsRanges = characteristics.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES) ?: return listOf(30)
-        val supported = mutableListOf<Int>()
-        if (fpsRanges.any { it.upper >= 60 }) {
-            supported.add(60)
-        }
-        supported.add(30)
-        return supported.distinct().sorted()
+        return listOf(18, 24, 30, 60)
     }
 
     private fun chooseFpsRange(): android.util.Range<Int>? {
@@ -990,10 +1021,15 @@ class CameraFragment : Fragment() {
         }
         val sortedChoices = if (matchingChoices.isNotEmpty()) matchingChoices else choices.toList()
         
+        if (videoResolution == VideoResolution.MAX) {
+            return sortedChoices.maxByOrNull { it.width * it.height } ?: choices.first()
+        }
+        
         val targetHeight = when (videoResolution) {
-            VideoResolution.UHD_4K -> 2160
+            VideoResolution.QHD_1440P -> 1440
             VideoResolution.FHD_1080P -> 1080
-            VideoResolution.HD_720P -> 720
+            VideoResolution.SD_480P -> 480
+            else -> 1080
         }
         
         val matchingResolutionChoices = sortedChoices.filter {
@@ -1004,23 +1040,13 @@ class CameraFragment : Fragment() {
             return matchingResolutionChoices.maxByOrNull { it.width * it.height }!!
         }
         
-        val fallbacks = when (videoResolution) {
-            VideoResolution.UHD_4K -> listOf(1080, 720)
-            VideoResolution.FHD_1080P -> listOf(720, 1080)
-            VideoResolution.HD_720P -> listOf(1080, 2160)
-        }
-        for (h in fallbacks) {
-            val fbChoices = sortedChoices.filter { it.width == h || it.height == h }
-            if (fbChoices.isNotEmpty()) {
-                return fbChoices.maxByOrNull { it.width * it.height }!!
-            }
+        // Fallback: find closest size by height
+        val closest = sortedChoices.minByOrNull { kotlin.math.abs(it.height - targetHeight) }
+        if (closest != null) {
+            return closest
         }
         
-        return sortedChoices.firstOrNull { it.width == 1920 && it.height == 1080 }
-            ?: sortedChoices.firstOrNull { it.width == 1440 && it.height == 1080 }
-            ?: sortedChoices.firstOrNull { it.width == 1280 && it.height == 720 }
-            ?: sortedChoices.maxByOrNull { it.width * it.height }
-            ?: choices.first()
+        return sortedChoices.maxByOrNull { it.width * it.height } ?: choices.first()
     }
 
     private fun setupMediaRecorder(videoSize: android.util.Size, rotation: Int, isTemp: Boolean = false) {
@@ -1076,6 +1102,48 @@ class CameraFragment : Fragment() {
             }
         }
 
+        // Try preparing with the requested target size. If the device H.264 encoder
+        // rejects the size/framerate combination, catch it and try robust fallbacks.
+        try {
+            configureAndPrepareMediaRecorder(videoSize, videoFrameRate, videoResolution, rotation)
+        } catch (e: Exception) {
+            Log.w(TAG, "MediaRecorder failed to prepare with size ${videoSize.width}x${videoSize.height} at $videoFrameRate FPS: ${e.message}. Trying 1080p fallback...", e)
+            
+            try {
+                val streamMap = characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+                val videoSizes = streamMap?.getOutputSizes(android.media.MediaRecorder::class.java) ?: emptyArray()
+                
+                val targetRatio = when (aspectRatio) {
+                    AspectRatio.RATIO_1_1 -> 1.0f
+                    AspectRatio.RATIO_4_3 -> 4.0f / 3.0f
+                    AspectRatio.RATIO_16_9 -> 16.0f / 9.0f
+                }
+                val tolerance = 0.05f
+                val matchingChoices = videoSizes.filter {
+                    val ratio = it.width.toFloat() / it.height.toFloat()
+                    kotlin.math.abs(ratio - targetRatio) < tolerance || kotlin.math.abs((1f / ratio) - targetRatio) < tolerance
+                }
+                val sortedChoices = if (matchingChoices.isNotEmpty()) matchingChoices else videoSizes.toList()
+                val fallbackSize = sortedChoices.firstOrNull { it.height == 1080 || it.width == 1080 }
+                    ?: sortedChoices.maxByOrNull { it.width * it.height }
+                    ?: android.util.Size(1920, 1080)
+
+                configureAndPrepareMediaRecorder(fallbackSize, videoFrameRate, VideoResolution.FHD_1080P, rotation)
+            } catch (e2: Exception) {
+                Log.w(TAG, "MediaRecorder failed fallback to 1080p: ${e2.message}. Trying safe defaults...", e2)
+                
+                try {
+                    val safeSize = android.util.Size(1920, 1080)
+                    configureAndPrepareMediaRecorder(safeSize, 30, VideoResolution.FHD_1080P, rotation)
+                } catch (e3: Exception) {
+                    Log.e(TAG, "MediaRecorder absolute fallback failed", e3)
+                    throw e3
+                }
+            }
+        }
+    }
+
+    private fun configureAndPrepareMediaRecorder(videoSize: android.util.Size, fps: Int, res: VideoResolution, rotation: Int) {
         mediaRecorder?.apply {
             setAudioSource(android.media.MediaRecorder.AudioSource.MIC)
             setVideoSource(android.media.MediaRecorder.VideoSource.SURFACE)
@@ -1084,8 +1152,13 @@ class CameraFragment : Fragment() {
             setVideoEncoder(android.media.MediaRecorder.VideoEncoder.H264)
             setAudioEncoder(android.media.MediaRecorder.AudioEncoder.AAC)
             setVideoSize(videoSize.width, videoSize.height)
-            setVideoFrameRate(videoFrameRate)
-            val bitrate = if (videoResolution == VideoResolution.UHD_4K) 20000000 else 10000000
+            setVideoFrameRate(fps)
+            val bitrate = when (res) {
+                VideoResolution.MAX -> 20000000
+                VideoResolution.QHD_1440P -> 16000000
+                VideoResolution.FHD_1080P -> 10000000
+                VideoResolution.SD_480P -> 4000000
+            }
             setVideoEncodingBitRate(bitrate)
             setAudioEncodingBitRate(96000)
             setAudioChannels(1)
@@ -1666,6 +1739,8 @@ class CameraFragment : Fragment() {
     }
 
     private fun reEnableUI() {
+        Log.d(TAG, "reEnableUI() called, setting isCameraInitializing to false")
+        isCameraInitializing = false
         fragmentCameraBinding.captureButton.isEnabled = true
         val count = fragmentCameraBinding.lensSelectorContainer?.childCount ?: 0
         for (i in 0 until count) {
@@ -1775,11 +1850,26 @@ class CameraFragment : Fragment() {
         _fragmentCameraBinding?.overlay?.setBackgroundColor(Color.TRANSPARENT)
         _fragmentCameraBinding?.overlay?.alpha = 0f
         
+        // Coerce video settings based on current camera characteristics (updates dynamically on startup & lens switches)
+        val supportedResolutions = getSupportedVideoResolutions()
+        var settingsChanged = false
+        if (videoResolution !in supportedResolutions) {
+            videoResolution = supportedResolutions.firstOrNull() ?: VideoResolution.MAX
+            settingsChanged = true
+        }
+        val supportedFramerates = getSupportedVideoFramerates()
+        if (videoFrameRate !in supportedFramerates) {
+            videoFrameRate = if (30 in supportedFramerates) 30 else supportedFramerates.firstOrNull() ?: 30
+            settingsChanged = true
+        }
+        if (settingsChanged) {
+            saveSettings()
+            updateSettingsUI()
+        }
+        
         // Disable UI during initialization (lens buttons too, so the user can't
         // bounce between lenses faster than the camera service can re-open).
-        if (!isRecordingVideo) {
-            fragmentCameraBinding.captureButton.isEnabled = false
-        }
+        isCameraInitializing = true
         val lensContainer = fragmentCameraBinding.lensSelectorContainer
         for (i in 0 until (lensContainer?.childCount ?: 0)) {
             lensContainer?.getChildAt(i)?.isEnabled = false
@@ -1953,7 +2043,9 @@ class CameraFragment : Fragment() {
                 }
 
                 // Start a capture session using our open camera and list of OutputConfigurations
+                Log.d(TAG, "Creating capture session...")
                 session = createCaptureSession(camera, outputs, cameraHandler)
+                Log.d(TAG, "Capture session created successfully.")
 
                 val template = if (isVideoMode) CameraDevice.TEMPLATE_RECORD else CameraDevice.TEMPLATE_PREVIEW
                 val captureRequest = camera.createCaptureRequest(template).apply { 
@@ -1970,14 +2062,19 @@ class CameraFragment : Fragment() {
                 session.setRepeatingRequest(captureRequest.build(), null, cameraHandler)
 
                 initialized = true
+                Log.d(TAG, "Camera initialized successfully.")
             } catch (exc: Exception) {
                 Log.e(TAG, "Failed to initialize camera components", exc)
             } finally {
-                if (!initialized) {
-                    Log.d(TAG, "Camera initialization failed or cancelled, releasing resources")
-                    releaseResources()
+                if (cameraJob == coroutineContext[kotlinx.coroutines.Job]) {
+                    if (!initialized) {
+                        Log.d(TAG, "Camera initialization failed or cancelled, releasing resources")
+                        releaseResources()
+                    }
+                    reEnableUI()
+                } else {
+                    Log.d(TAG, "Camera initialization cancelled by a newer job, skipping cleanup/reEnableUI")
                 }
-                reEnableUI()
             }
         }
     }
@@ -2019,6 +2116,7 @@ class CameraFragment : Fragment() {
     }
 
     private fun handleCaptureClick(button: View) {
+        Log.d(TAG, "handleCaptureClick called. session.isInitialized = ${::session.isInitialized}")
         if (!::session.isInitialized) return
         
         // Provide haptic feedback for shutter
@@ -2118,7 +2216,12 @@ class CameraFragment : Fragment() {
             manager.openCamera(cameraId, object : CameraDevice.StateCallback() {
                 override fun onOpened(device: CameraDevice) {
                     isCameraClosed = false
-                    cont.resume(device)
+                    if (cont.isActive) {
+                        cont.resume(device)
+                    } else {
+                        Log.d(TAG, "openCamera.onOpened: Coroutine was cancelled, closing device")
+                        device.close()
+                    }
                 }
 
                 override fun onDisconnected(device: CameraDevice) {
@@ -2161,7 +2264,12 @@ class CameraFragment : Fragment() {
     ): CameraCaptureSession = suspendCancellableCoroutine { cont ->
         val callback = object : CameraCaptureSession.StateCallback() {
             override fun onConfigured(session: CameraCaptureSession) {
-                if (cont.isActive) cont.resume(session)
+                if (cont.isActive) {
+                    cont.resume(session)
+                } else {
+                    Log.d(TAG, "createCaptureSession.onConfigured: Coroutine was cancelled, closing session")
+                    session.close()
+                }
             }
 
             override fun onConfigureFailed(session: CameraCaptureSession) {
@@ -2627,6 +2735,8 @@ class CameraFragment : Fragment() {
         sharedPrefs.edit().apply {
             putString("pref_output_format", outputFormat.name)
             putString("pref_aspect_ratio", aspectRatio.name)
+            putString("pref_photo_aspect_ratio", photoAspectRatio.name)
+            putString("pref_video_aspect_ratio", videoAspectRatio.name)
             putBoolean("pref_is_square", aspectRatio == AspectRatio.RATIO_1_1)
             putInt("pref_flash_mode", flashMode)
             putString("pref_film_simulation", filmSimulation.name)
