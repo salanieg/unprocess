@@ -555,11 +555,11 @@ class CameraFragment : Fragment() {
     private fun updateModeToggleUI() {
         val binding = _fragmentCameraBinding ?: return
         if (isVideoMode) {
-            binding.modeToggle?.text = "Format: MP4"
+            binding.modeToggle?.text = "File Format MP4"
             binding.modeToggle?.isEnabled = false
             binding.modeToggle?.let { setButtonActiveStyle(it, false) }
         } else {
-            binding.modeToggle?.text = "Format: ${outputFormat.name}"
+            binding.modeToggle?.text = "File Format ${outputFormat.name}"
             val modeToggleAvailable = !isProcessing
             binding.modeToggle?.isEnabled = modeToggleAvailable
             binding.modeToggle?.let { setButtonActiveStyle(it, modeToggleAvailable) }
@@ -582,7 +582,7 @@ class CameraFragment : Fragment() {
             AspectRatio.RATIO_4_3 -> getString(R.string.aspect_ratio_full)
             AspectRatio.RATIO_16_9 -> getString(R.string.aspect_ratio_16_9)
         }
-        fragmentCameraBinding.aspectRatioToggle?.text = "Aspect Ratio: $ratioText"
+        fragmentCameraBinding.aspectRatioToggle?.text = "Aspect Ratio $ratioText"
     }
 
     private var allCameraIds: List<String> = emptyList()
@@ -956,7 +956,7 @@ class CameraFragment : Fragment() {
             VideoPreset.NORMAL -> getString(R.string.preset_normal)
             VideoPreset.SUPER8 -> getString(R.string.preset_super8)
         }
-        binding.presetToggle?.text = "Filmmodus: $presetText"
+        binding.presetToggle?.text = "Film Mode $presetText"
 
         // The filter only takes effect on the RAW→Bitmap→JPEG conversion
         // path. In pure RAW (DNG) mode the saved file is just the sensor
@@ -981,10 +981,10 @@ class CameraFragment : Fragment() {
             VideoResolution.FHD_1080P -> "1080p"
             VideoResolution.SD_480P -> "480p"
         }
-        binding.resolutionToggle?.text = "Resolution: $resText"
+        binding.resolutionToggle?.text = "Resolution $resText"
         
         // Update framerate toggle text
-        binding.framerateToggle?.text = "Frame Rate: ${videoFrameRate} FPS"
+        binding.framerateToggle?.text = "Frame Rate ${videoFrameRate} FPS"
 
         updateAspectRatioUI()
         updateFlashUI()
@@ -995,7 +995,7 @@ class CameraFragment : Fragment() {
 
     private fun updateFilterUI() {
         val cleanName = filmSimulation.displayName.replace("Film ", "")
-        fragmentCameraBinding.filterToggle?.text = "Filmmodus: $cleanName"
+        fragmentCameraBinding.filterToggle?.text = "Film Mode $cleanName"
     }
 
     private fun updateMovieToggleUI() {

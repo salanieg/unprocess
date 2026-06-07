@@ -252,6 +252,7 @@
             android:minHeight="0dp"
             app:iconGravity="textStart"
             app:iconPadding="0dp"
+            app:iconSize="22dp"
             app:shapeAppearanceOverlay="@style/ShapeAppearance.Material3.Corner.Full" />
 
         <com.google.android.material.button.MaterialButton
@@ -269,6 +270,7 @@
             android:minHeight="0dp"
             app:iconGravity="textStart"
             app:iconPadding="0dp"
+            app:iconSize="22dp"
             app:shapeAppearanceOverlay="@style/ShapeAppearance.Material3.Corner.Full" />
 
         <com.google.android.material.button.MaterialButton
@@ -286,6 +288,7 @@
             app:icon="@drawable/ic_settings"
             app:iconGravity="textStart"
             app:iconPadding="0dp"
+            app:iconSize="22dp"
             app:shapeAppearanceOverlay="@style/ShapeAppearance.Material3.Corner.Full" />
 
     </LinearLayout>
@@ -318,7 +321,12 @@
             android:insetLeft="0dp"
             android:insetRight="0dp"
             android:minWidth="0dp"
-            android:minHeight="0dp" />
+            android:minHeight="0dp"
+            android:paddingStart="64dp"
+            android:paddingEnd="64dp"
+            app:icon="@drawable/ic_aspect_ratio"
+            app:iconPadding="8dp"
+            app:iconGravity="start" />
 
         <com.google.android.material.button.MaterialButton
             android:id="@+id/resolution_toggle"
@@ -335,7 +343,12 @@
             android:insetRight="0dp"
             android:minWidth="0dp"
             android:minHeight="0dp"
-            android:visibility="gone" />
+            android:visibility="gone"
+            android:paddingStart="64dp"
+            android:paddingEnd="64dp"
+            app:icon="@drawable/ic_resolution"
+            app:iconPadding="8dp"
+            app:iconGravity="start" />
 
         <com.google.android.material.button.MaterialButton
             android:id="@+id/framerate_toggle"
@@ -352,7 +365,12 @@
             android:insetRight="0dp"
             android:minWidth="0dp"
             android:minHeight="0dp"
-            android:visibility="gone" />
+            android:visibility="gone"
+            android:paddingStart="64dp"
+            android:paddingEnd="64dp"
+            app:icon="@drawable/ic_frame_rate"
+            app:iconPadding="8dp"
+            app:iconGravity="start" />
 
         <com.google.android.material.button.MaterialButton
             android:id="@+id/preset_toggle"
@@ -369,7 +387,12 @@
             android:insetRight="0dp"
             android:minWidth="0dp"
             android:minHeight="0dp"
-            android:visibility="gone" />
+            android:visibility="gone"
+            android:paddingStart="64dp"
+            android:paddingEnd="64dp"
+            app:icon="@drawable/ic_film_mode"
+            app:iconPadding="8dp"
+            app:iconGravity="start" />
 
         <com.google.android.material.button.MaterialButton
             android:id="@+id/mode_toggle"
@@ -385,7 +408,12 @@
             android:insetLeft="0dp"
             android:insetRight="0dp"
             android:minWidth="0dp"
-            android:minHeight="0dp" />
+            android:minHeight="0dp"
+            android:paddingStart="64dp"
+            android:paddingEnd="64dp"
+            app:icon="@drawable/ic_file_format"
+            app:iconPadding="8dp"
+            app:iconGravity="start" />
 
         <com.google.android.material.button.MaterialButton
             android:id="@+id/filter_toggle"
@@ -400,7 +428,12 @@
             android:insetLeft="0dp"
             android:insetRight="0dp"
             android:minWidth="0dp"
-            android:minHeight="0dp" />
+            android:minHeight="0dp"
+            android:paddingStart="64dp"
+            android:paddingEnd="64dp"
+            app:icon="@drawable/ic_film_mode"
+            app:iconPadding="8dp"
+            app:iconGravity="start" />
 
     </LinearLayout>
 
