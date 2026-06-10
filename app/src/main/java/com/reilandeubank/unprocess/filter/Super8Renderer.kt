@@ -284,9 +284,17 @@ class Super8Renderer private constructor(
         val t = frameCount / 18f
         GLES20.glUniform1f(uTimeLoc, t)
         GLES20.glUniform1f(uSeedLoc, (frameCount * 0.6180339887f) % 1000f)
-        // Gate weave: tiny per-frame translation of the sampled image.
-        val jx = (Math.sin(frameCount * 0.7).toFloat()) * 0.0015f
-        val jy = (Math.cos(frameCount * 1.1).toFloat()) * 0.0020f
+        // Gate weave: real Super-8 transport drifts slowly (pressure plate)
+        // with small per-frame randomness on top (claw registration), and the
+        // vertical axis moves more than the horizontal. Pure sinusoids read as
+        // artificial, so layer incommensurate sines with seeded noise, plus an
+        // occasional one-frame vertical hop when the claw re-seats.
+        val rnd = java.util.Random(frameCount * 7919L)
+        val driftX = Math.sin(frameCount * 0.23) * 0.6 + Math.sin(frameCount * 0.71) * 0.4
+        val driftY = Math.sin(frameCount * 0.19 + 1.3) * 0.6 + Math.sin(frameCount * 0.53) * 0.4
+        val jx = (driftX * 0.5 + (rnd.nextDouble() - 0.5)).toFloat() * 0.0016f
+        var jy = (driftY * 0.5 + (rnd.nextDouble() - 0.5)).toFloat() * 0.0026f
+        if (rnd.nextDouble() < 0.04) jy += (rnd.nextFloat() - 0.5f) * 0.012f
         GLES20.glUniform2f(uJitterLoc, jx, jy)
         GLES20.glUniform2f(uResolutionLoc, width.toFloat(), height.toFloat())
 
@@ -512,16 +520,40 @@ class Super8Renderer private constructor(
         """
 
         /**
-         * Super-8 look, computed entirely in the shader (procedural LUT — no
-         * .cube file). The colour transform targets the warm, slightly faded,
-         * lifted-black Kodachrome/Ektachrome signature of consumer Super-8
-         * stock; on top of it sit the mechanical/optical artefacts of the
-         * format: vignette, animated grain, projector flicker, halation glow,
-         * gate weave (in the vertex stage) and the occasional scratch/dust.
+         * Super-8 look, computed entirely in the shader (procedural — no .cube
+         * file). Unlike a flat "grade on top of video" filter, the stages are
+         * ordered the way light actually moves through a Super-8 camera and an
+         * aged reversal print:
+         *
+         *  1. Lens: radial chromatic aberration, softness rising to the corners
+         *     (the tiny f/1.8 zooms in Super-8 cameras were never sharp wide
+         *     open, and the 5.8x4mm frame can't resolve digital sharpness).
+         *  2. Light domain (linear): exposure/projector flicker, halation
+         *     (an actual blur of neighbouring highlights bleeding red-orange
+         *     through the emulsion — not a per-pixel brightness hack), warm
+         *     daylight-filter balance, dye-crosstalk matrix (what really gives
+         *     film its colour separation, far more than any curve).
+         *  3. Emulsion response (per channel): S-curve with the blue layer
+         *     rolling off first → warm highlights, brown-warm shadows, the
+         *     Kodachrome signature.
+         *  4. Age: lifted warm blacks + creamy whites (print fade), hue-aware
+         *     saturation (reds stay vivid, skies wash out, highlights desaturate).
+         *  5. Mechanics: vignette, multi-octave soft grain (luma-weighted, with
+         *     a chroma component), persistent wobbling scratches (bright base-
+         *     side and dark emulsion-side), round dark/bright dust, gate weave
+         *     (vertex stage, fed per-frame from Kotlin).
+         *
+         * highp where the GPU has it: the grain/hash math overflows strict
+         * mediump (half-float) ranges on some Mali GPUs; the hash also wraps
+         * its domain so the mediump fallback stays artefact-free.
          */
         private const val FRAGMENT_SHADER = """
             #extension GL_OES_EGL_image_external : require
+            #ifdef GL_FRAGMENT_PRECISION_HIGH
+            precision highp float;
+            #else
             precision mediump float;
+            #endif
             varying vec2 vTexCoord;
             uniform samplerExternalOES sTexture;
             uniform float uTime;
@@ -529,65 +561,159 @@ class Super8Renderer private constructor(
             uniform vec2 uResolution;
 
             float hash(vec2 p) {
-                p = fract(p * vec2(123.34, 456.21));
-                p += dot(p, p + 45.32);
-                return fract(p.x * p.y);
+                // Domain-wrapped so intermediates stay finite even in mediump.
+                p = mod(p, 512.0);
+                vec3 p3 = fract(vec3(p.x, p.y, p.x) * 0.1031);
+                p3 += dot(p3, p3.yzx + 33.33);
+                return fract((p3.x + p3.y) * p3.z);
+            }
+
+            // Bilinear value noise — soft blobs instead of per-pixel salt,
+            // which is what real silver-halide grain clumps look like.
+            float vnoise(vec2 p) {
+                vec2 i = floor(p);
+                vec2 f = fract(p);
+                f = f * f * (3.0 - 2.0 * f);
+                float a = hash(i);
+                float b = hash(i + vec2(1.0, 0.0));
+                float c = hash(i + vec2(0.0, 1.0));
+                float d = hash(i + vec2(1.0, 1.0));
+                return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
             }
 
             void main() {
                 vec2 uv = clamp(vTexCoord, 0.0, 1.0);
-                vec3 col = texture2D(sTexture, uv).rgb;
-
-                // --- Procedural LUT: natural Super-8 colour grading ---
-                // Aim is a believable consumer-film look (Kodachrome/Ektachrome
-                // home movie), NOT a heavy sepia: gentle contrast, slightly
-                // lifted "milky" blacks, a soft warm cast and lightly muted but
-                // still present colour.
-                // Soft S-curve — film has gentle, rolled-off contrast.
-                col = (col - 0.5) * 1.06 + 0.5;
-                // Lifted, slightly milky blacks (aged film base).
-                col = col * 0.93 + 0.035;
-                // Light desaturation — film is a touch muted but keeps its hues.
-                float luma = dot(col, vec3(0.299, 0.587, 0.114));
-                col = mix(vec3(luma), col, 0.90);
-                // Gentle warm balance (natural, not orange).
-                col.r *= 1.045;
-                col.g *= 1.005;
-                col.b *= 0.95;
-                // Subtle cohesive warm tone: a little in highlights and shadows.
-                col += vec3(0.022, 0.010, 0.0) * smoothstep(0.5, 1.0, luma);
-                col += vec3(0.018, 0.008, 0.0) * (1.0 - smoothstep(0.0, 0.5, luma));
-
-                // --- Halation: faint warm glow bleeding from highlights ---
-                col += vec3(0.06, 0.02, 0.0) * pow(max(luma - 0.65, 0.0), 2.0) * 2.0;
-
-                // --- Vignette (soft, gently darkened corners) ---
                 vec2 q = uv - 0.5;
-                float vig = 1.0 - dot(q, q) * 1.25;
-                vig = clamp(vig, 0.0, 1.0);
-                col *= mix(0.6, 1.0, vig);
+                float r2 = dot(q, q);
+                vec2 px = 1.0 / uResolution;
 
-                // --- Projector flicker (brightness fluctuation) ---
+                // --- Lens: radial chromatic aberration (zero at centre) ---
+                vec2 ca = q * r2 * 0.010;
+                vec3 col;
+                col.r = texture2D(sTexture, clamp(uv + ca, 0.0, 1.0)).r;
+                col.g = texture2D(sTexture, uv).g;
+                col.b = texture2D(sTexture, clamp(uv - ca, 0.0, 1.0)).b;
+
+                // --- Lens/film MTF + halation source, one hexagonal ring ---
+                // Inner taps soften the image (more toward the corners), the
+                // outer taps collect neighbouring highlights for halation.
+                vec3 blurAcc = vec3(0.0);
+                float halAcc = 0.0;
+                for (int i = 0; i < 6; i++) {
+                    float ang = float(i) * 1.0471976;
+                    vec2 d = vec2(cos(ang), sin(ang));
+                    blurAcc += texture2D(sTexture, clamp(uv + d * px * 1.6, 0.0, 1.0)).rgb;
+                    vec3 h = texture2D(sTexture, clamp(uv + d * px * 6.0, 0.0, 1.0)).rgb;
+                    halAcc += max(dot(h, vec3(0.299, 0.587, 0.114)) - 0.62, 0.0);
+                }
+                blurAcc /= 6.0;
+                halAcc /= 6.0;
+                float softAmt = 0.35 + 0.40 * smoothstep(0.05, 0.45, r2);
+                col = mix(col, blurAcc, softAmt);
+
+                // --- Light domain (approx. linear) ---
+                vec3 lin = col * col;
+
+                // Projector/shutter flicker is an exposure change, so it
+                // belongs on linear light, not on graded pixels.
                 float flick = 1.0
-                    + 0.05 * sin(uTime * 7.0)
-                    + 0.025 * sin(uTime * 19.0)
-                    + (hash(vec2(uSeed, 1.7)) - 0.5) * 0.06;
-                col *= flick;
+                    + 0.045 * sin(uTime * 6.7)
+                    + 0.020 * sin(uTime * 17.3)
+                    + (hash(vec2(uSeed, 1.7)) - 0.5) * 0.07;
+                lin *= flick;
 
-                // --- Animated film grain ---
-                float g = hash(uv * uResolution * 0.65 + uSeed);
-                col += (g - 0.5) * 0.13;
+                // Halation: highlights bleed through the base and expose the
+                // red-sensitive layer from behind — warm glow around lights.
+                lin += vec3(1.0, 0.30, 0.08) * (halAcc * halAcc) * 1.6;
 
-                // --- Occasional vertical scratch ---
-                float scratchX = hash(vec2(floor(uSeed * 7.0), 3.0));
-                float scratch = smoothstep(0.0025, 0.0, abs(uv.x - scratchX));
-                float scratchOn = step(0.72, hash(vec2(floor(uSeed * 3.0), 9.0)));
-                col += scratch * scratchOn * 0.22;
+                // Warm daylight-filter balance (tungsten film + Wratten 85).
+                lin *= vec3(1.06, 1.00, 0.90);
 
-                // --- Sparse dust specks ---
-                float dust = hash(floor(uv * uResolution / 3.0) + floor(uSeed * 53.0));
-                if (dust > 0.9965) {
-                    col += 0.45;
+                // Dye crosstalk: film dyes are impure, and masking pushes the
+                // channels apart. This matrix (rows sum to 1 → neutrals stay
+                // neutral) is what makes colour read as "film" rather than
+                // "video with a tint".
+                lin = vec3(
+                    dot(lin, vec3(1.14, -0.10, -0.04)),
+                    dot(lin, vec3(-0.05, 1.13, -0.08)),
+                    dot(lin, vec3(-0.03, -0.12, 1.15)));
+                lin = max(lin, 0.0);
+
+                col = sqrt(lin);
+
+                // --- Emulsion response ---
+                // Reversal-film S-curve, mid-tones anchored so exposure stays
+                // honest; then per-channel gamma — the blue layer rolls off
+                // first, which is where the warm Kodachrome cast really lives.
+                vec3 s = col * col * (3.0 - 2.0 * col);
+                col = mix(col, s, 0.42);
+                col = pow(col, vec3(0.985, 1.0, 1.06));
+
+                // Aged print fade: warm lifted blacks, creamy (not clipped)
+                // whites. Replaces a flat "milky" lift.
+                col = col * vec3(0.94, 0.92, 0.88) + vec3(0.050, 0.042, 0.032);
+
+                // Hue-aware saturation: Kodachrome reds stay punchy, blue skies
+                // wash out, and highlights desaturate toward warm white.
+                float luma = dot(col, vec3(0.299, 0.587, 0.114));
+                float redness = smoothstep(0.0, 0.4, col.r - max(col.g, col.b));
+                float blueness = smoothstep(0.0, 0.4, col.b - max(col.r, col.g));
+                float sat = 0.85 + 0.25 * redness - 0.20 * blueness
+                    - 0.30 * smoothstep(0.75, 1.0, luma);
+                col = mix(vec3(luma), col, clamp(sat, 0.0, 1.15));
+
+                // --- Vignette: smooth roll-off, never a hard ring ---
+                col *= 1.0 - smoothstep(0.10, 0.62, r2) * 0.45;
+
+                // --- Film grain: two octaves of soft value noise, strongest
+                // in shadows/mids (reversal stock), with a slight chroma
+                // component so it doesn't read as digital luma noise.
+                float gsz = max(uResolution.y / 360.0, 1.0);
+                vec2 gp = uv * uResolution / gsz;
+                vec2 gShift = vec2(hash(vec2(uSeed, 3.1)), hash(vec2(uSeed, 7.7))) * 100.0;
+                float gn = vnoise(gp + gShift) * 0.65
+                         + vnoise(gp * 0.5 + gShift.yx + 31.7) * 0.35;
+                float gAmp = mix(0.085, 0.030, smoothstep(0.10, 0.85, luma));
+                col += (gn - 0.5) * gAmp;
+                float gc = vnoise(gp * 0.7 + gShift + 57.3);
+                col += (gc - 0.5) * gAmp * vec3(0.35, -0.20, 0.30);
+
+                // --- Scratches: persist for ~2 s, wobble per frame, intensity
+                // broken along their length. Bright = base-side, dark =
+                // emulsion-side (both exist on real prints).
+                float ep = floor(uTime * 0.45);
+                if (hash(vec2(ep, 11.0)) > 0.65) {
+                    float sx = 0.08 + 0.84 * hash(vec2(ep, 23.0))
+                        + (hash(vec2(uSeed, 31.0)) - 0.5) * 0.008;
+                    float w = (0.6 + 0.9 * hash(vec2(ep, 41.0))) * px.x;
+                    float li = 1.0 - smoothstep(0.0, w, abs(uv.x - sx));
+                    li *= smoothstep(0.25, 0.6, vnoise(vec2(uv.y * 70.0, ep * 13.0 + uSeed)));
+                    col += li * 0.30;
+                }
+                if (hash(vec2(ep, 53.0)) > 0.78) {
+                    float sx2 = 0.08 + 0.84 * hash(vec2(ep, 67.0))
+                        + (hash(vec2(uSeed, 71.0)) - 0.5) * 0.006;
+                    float w2 = (0.8 + 1.2 * hash(vec2(ep, 83.0))) * px.x;
+                    float li2 = 1.0 - smoothstep(0.0, w2, abs(uv.x - sx2));
+                    li2 *= smoothstep(0.3, 0.7, vnoise(vec2(uv.y * 50.0, ep * 17.0 + uSeed * 1.3)));
+                    col *= 1.0 - li2 * 0.5;
+                }
+
+                // --- Dust: round specks, mostly dark dirt with the odd bright
+                // fleck, roughly one per frame at 18 fps.
+                float cells = 24.0;
+                vec2 duv = vec2(uv.x * uResolution.x / uResolution.y, uv.y) * cells;
+                vec2 cid = floor(duv);
+                vec2 seedC = vec2(floor(uSeed * 91.0), floor(uSeed * 57.0));
+                if (hash(cid + seedC) > 0.9985) {
+                    vec2 c = vec2(hash(cid + seedC + 11.1), hash(cid + seedC + 17.7));
+                    float rad = 0.10 + 0.22 * hash(cid + seedC + 23.3);
+                    float spec = 1.0 - smoothstep(rad * 0.35, rad, length(fract(duv) - c));
+                    if (hash(cid + seedC + 29.9) > 0.75) {
+                        col += spec * 0.5;
+                    } else {
+                        col = mix(col, col * 0.2, spec * 0.9);
+                    }
                 }
 
                 gl_FragColor = vec4(clamp(col, 0.0, 1.0), 1.0);
