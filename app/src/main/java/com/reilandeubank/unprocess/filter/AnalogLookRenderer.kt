@@ -25,10 +25,13 @@ import java.util.concurrent.TimeUnit
  *
  * - [SUPER8]: Kodachrome-style reversal film at the format's 18 fps.
  * - [VHS]: PAL consumer camcorder at 25 fps (the European VHS standard).
+ * - [CINEMATIC]: scene-adaptive digital-cinema grade at film's 24 fps. The
+ *   grade parameters come from [SceneAnalyzer] via [setCinematicGrade].
  */
 enum class AnalogLook(val fps: Int) {
     SUPER8(18),
     VHS(25),
+    CINEMATIC(24),
 }
 
 /**
@@ -91,6 +94,17 @@ class AnalogLookRenderer private constructor(
     private var uResolutionLoc = 0
     private var uVidXLoc = 0
     private var uVidYLoc = 0
+    private var uGradeALoc = 0
+    private var uGradeBLoc = 0
+    private var uGradeCLoc = 0
+    private var uShadowTintLoc = 0
+    private var uHighlightTintLoc = 0
+
+    /** Scene-adaptive grade uniforms for [AnalogLook.CINEMATIC] — written
+     *  from the UI thread when "Analyze Scene" completes, read on the GL
+     *  thread every frame. Starts as a tasteful neutral film grade so a
+     *  recording can never go out ungraded. */
+    @Volatile private var cinematicUniforms: FloatArray = NEUTRAL_CINEMATIC_GRADE
 
     /** Clockwise rotation baked into [encoderMvp]; needed to map video-space
      *  directions back into texture space for the VHS shader. */
@@ -119,6 +133,15 @@ class AnalogLookRenderer private constructor(
     fun inputSurfaceOrNull(): Surface? =
         if (!released && ::inputSurfaceInternal.isInitialized) inputSurfaceInternal else null
 
+    /**
+     * Updates the [AnalogLook.CINEMATIC] grade (the 18 floats produced by
+     * `CinematicGrade.toUniforms()`). Safe to call from any thread at any
+     * time — the next rendered frame picks it up. No-op for other looks.
+     */
+    fun setCinematicGrade(uniforms: FloatArray) {
+        if (uniforms.size >= 18) cinematicUniforms = uniforms.copyOf()
+    }
+
     private fun initOnGlThread() {
         Matrix.setIdentityM(encoderMvp, 0)
         initEgl()
@@ -128,6 +151,7 @@ class AnalogLookRenderer private constructor(
             when (look) {
                 AnalogLook.SUPER8 -> SUPER8_FRAGMENT_SHADER
                 AnalogLook.VHS -> VHS_FRAGMENT_SHADER
+                AnalogLook.CINEMATIC -> CINEMATIC_FRAGMENT_SHADER
             },
         )
         oesTextureId = createOesTexture()
@@ -335,6 +359,17 @@ class AnalogLookRenderer private constructor(
                 // the fragment shader, in video space.
                 GLES20.glUniform2f(uJitterLoc, 0f, 0f)
             }
+            AnalogLook.CINEMATIC -> {
+                // Digital cinema is rock steady — no jitter. Upload the
+                // scene-adaptive grade instead (cheap: 18 floats per frame).
+                GLES20.glUniform2f(uJitterLoc, 0f, 0f)
+                val g = cinematicUniforms
+                GLES20.glUniform4f(uGradeALoc, g[0], g[1], g[2], g[3])
+                GLES20.glUniform4f(uGradeBLoc, g[4], g[5], g[6], g[7])
+                GLES20.glUniform3f(uShadowTintLoc, g[8], g[9], g[10])
+                GLES20.glUniform3f(uHighlightTintLoc, g[11], g[12], g[13])
+                GLES20.glUniform4f(uGradeCLoc, g[14], g[15], g[16], g[17])
+            }
         }
         GLES20.glUniform2f(uResolutionLoc, width.toFloat(), height.toFloat())
 
@@ -503,6 +538,11 @@ class AnalogLookRenderer private constructor(
         // -1 (silently ignored by glUniform*) for looks that don't declare them.
         uVidXLoc = GLES20.glGetUniformLocation(prog, "uVidX")
         uVidYLoc = GLES20.glGetUniformLocation(prog, "uVidY")
+        uGradeALoc = GLES20.glGetUniformLocation(prog, "uGradeA")
+        uGradeBLoc = GLES20.glGetUniformLocation(prog, "uGradeB")
+        uGradeCLoc = GLES20.glGetUniformLocation(prog, "uGradeC")
+        uShadowTintLoc = GLES20.glGetUniformLocation(prog, "uShadowTint")
+        uHighlightTintLoc = GLES20.glGetUniformLocation(prog, "uHighlightTint")
         return prog
     }
 
@@ -951,6 +991,173 @@ class AnalogLookRenderer private constructor(
                 // --- Interlace hint: every other line a touch darker (kept
                 // subtle so playback scaling can't moiré) ---
                 col *= 1.0 - 0.035 * step(0.5, fract(line * 0.5));
+
+                gl_FragColor = vec4(clamp(col, 0.0, 1.0), 1.0);
+            }
+        """
+
+        /**
+         * Fallback grade used until [setCinematicGrade] delivers the
+         * scene-adaptive one: mild S-curve, gentle HDR toe/shoulder, subtle
+         * teal-shadow/golden-highlight split — a safe, flattering default.
+         * Layout matches `CinematicGrade.toUniforms()`.
+         */
+        private val NEUTRAL_CINEMATIC_GRADE = floatArrayOf(
+            0f, 0.22f, 0.16f, 0.50f,
+            1f, 1f, 1.04f, 0.10f,
+            -0.014f, 0.003f, 0.022f,
+            0.020f, 0.010f, -0.014f,
+            0.45f, 0.38f, 0.24f, 0.045f,
+        )
+
+        /**
+         * Scene-adaptive cinematic grade. Unlike the two analogue looks this
+         * shader is parameterised: the uniforms carry a grade computed from
+         * an actual analysis of the scene (see SceneAnalyzer), so the same
+         * shader renders a warm golden-hour grade, a halated neon night or
+         * an airy high key depending on what the camera is pointed at.
+         *
+         * Stage order follows a colourist's pipeline:
+         *
+         *  1. Optics: fine-detail diffusion (uGradeC.y) takes the clinical
+         *     digital edge off, and a wider highlight gather feeds the
+         *     Pro-Mist-style bloom — softness as a *grade* parameter.
+         *  2. Linear light: exposure trim (uGradeA.x as EV), white balance
+         *     (uGradeB.xy), and the highlight diffusion added where light
+         *     would actually scatter (uGradeC.x).
+         *  3. HDR tone shaping: toe lift reveals shadow detail without
+         *     greying the blacks (uGradeA.z), a quadratic shoulder above
+         *     0.72 rolls highlights off film-style instead of clipping
+         *     (uGradeA.w) — the "HDR" feel, done stably in one pass.
+         *  4. Mid-anchored S-curve contrast (uGradeA.y).
+         *  5. Colour: split toning (uShadowTint/uHighlightTint, near-zero-
+         *     mean so luma stays honest), then vibrance-weighted saturation
+         *     with skin protection — faces never go teal or oversaturated.
+         *  6. Finish: gentle vignette and fine 35mm-ish grain (far subtler
+         *     than Super-8), both grade-controlled.
+         *
+         * Same mediump-safe hash/noise as the other looks; everything stays
+         * in [0,1]-adjacent ranges, so it runs artefact-free on every GPU
+         * the SUPER8/VHS shaders run on.
+         */
+        private const val CINEMATIC_FRAGMENT_SHADER = """
+            #extension GL_OES_EGL_image_external : require
+            #ifdef GL_FRAGMENT_PRECISION_HIGH
+            precision highp float;
+            #else
+            precision mediump float;
+            #endif
+            varying vec2 vTexCoord;
+            uniform samplerExternalOES sTexture;
+            uniform float uSeed;
+            uniform vec2 uResolution;
+            uniform vec4 uGradeA; // exposure EV, contrast, shadow lift, highlight roll
+            uniform vec4 uGradeB; // WB red mul, WB blue mul, saturation, vibrance
+            uniform vec3 uShadowTint;
+            uniform vec3 uHighlightTint;
+            uniform vec4 uGradeC; // bloom, softness, vignette, grain
+
+            float hash(vec2 p) {
+                p = mod(p, 512.0);
+                vec3 p3 = fract(vec3(p.x, p.y, p.x) * 0.1031);
+                p3 += dot(p3, p3.yzx + 33.33);
+                return fract((p3.x + p3.y) * p3.z);
+            }
+
+            float vnoise(vec2 p) {
+                vec2 i = floor(p);
+                vec2 f = fract(p);
+                f = f * f * (3.0 - 2.0 * f);
+                float a = hash(i);
+                float b = hash(i + vec2(1.0, 0.0));
+                float c = hash(i + vec2(0.0, 1.0));
+                float d = hash(i + vec2(1.0, 1.0));
+                return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
+            }
+
+            float lum(vec3 c) {
+                return dot(c, vec3(0.299, 0.587, 0.114));
+            }
+
+            void main() {
+                vec2 uv = clamp(vTexCoord, 0.0, 1.0);
+                vec2 q = uv - 0.5;
+                float r2 = dot(q, q);
+                vec2 px = 1.0 / uResolution;
+
+                vec3 col = texture2D(sTexture, uv).rgb;
+
+                // --- Diffusion + glow gather: one hexagonal ring at two radii ---
+                vec3 blurAcc = vec3(0.0);
+                vec3 glowAcc = vec3(0.0);
+                for (int i = 0; i < 6; i++) {
+                    float ang = float(i) * 1.0471976 + 0.5235988;
+                    vec2 d = vec2(cos(ang), sin(ang));
+                    blurAcc += texture2D(sTexture, clamp(uv + d * px * 1.5, 0.0, 1.0)).rgb;
+                    vec3 h = texture2D(sTexture, clamp(uv + d * px * 7.0, 0.0, 1.0)).rgb;
+                    glowAcc += h * smoothstep(0.62, 0.95, lum(h));
+                }
+                blurAcc /= 6.0;
+                glowAcc /= 6.0;
+
+                // Softness: fine-detail diffusion, well below "out of focus".
+                col = mix(col, blurAcc, uGradeC.y * 0.55);
+
+                // --- Linear light: exposure, white balance, bloom ---
+                vec3 lin = col * col;
+                float gain = exp2(uGradeA.x);
+                lin *= gain;
+                lin *= vec3(uGradeB.x, 1.0, uGradeB.y);
+                vec3 glow = glowAcc * glowAcc * gain;
+                lin += glow * uGradeC.x * 0.5;
+                lin = max(lin, 0.0);
+
+                col = sqrt(lin);
+
+                // --- HDR tone shaping ---
+                // Toe lift: peaks in the lower mids, leaves true black
+                // anchored (the +0.05 keeps crushed shadows from staying
+                // pinned at zero).
+                vec3 inv = 1.0 - col;
+                col += uGradeA.z * 0.55 * (col + 0.05) * inv * inv;
+                // Shoulder: quadratic knee above 0.72 — highlights compress
+                // smoothly into a creamy white instead of clipping.
+                vec3 over = max(col - 0.72, 0.0);
+                col -= over * over * (uGradeA.w * 1.7);
+
+                // --- Mid-anchored S-curve contrast ---
+                vec3 s = col * col * (3.0 - 2.0 * col);
+                col = mix(col, s, uGradeA.y);
+
+                // --- Split-toned colour grade ---
+                float y = lum(col);
+                float shW = (1.0 - y) * (1.0 - y);
+                float hiW = y * y;
+                col += uShadowTint * shW + uHighlightTint * hiW;
+
+                // --- Saturation/vibrance with skin protection ---
+                y = lum(col);
+                float mx = max(col.r, max(col.g, col.b));
+                float mn = min(col.r, min(col.g, col.b));
+                float satNow = (mx <= 0.0) ? 0.0 : (mx - mn) / mx;
+                float factor = uGradeB.z + uGradeB.w * (1.0 - satNow);
+                // Skin-like pixels (r > g > b) keep a near-neutral factor so
+                // faces never pick up the push meant for the scenery.
+                float skinW = clamp((col.r - col.g) * 5.0, 0.0, 1.0)
+                            * clamp((col.g - col.b) * 5.0, 0.0, 1.0);
+                factor = mix(factor, min(factor, 1.04), skinW * 0.75);
+                col = mix(vec3(y), col, factor);
+
+                // --- Vignette: wide and gentle, draws the eye inward ---
+                col *= 1.0 - smoothstep(0.12, 0.72, r2) * uGradeC.z;
+
+                // --- Fine grain: two soft octaves, fades in highlights ---
+                float gsz = max(uResolution.y / 720.0, 1.0);
+                vec2 gp = uv * uResolution / gsz;
+                vec2 gShift = vec2(hash(vec2(uSeed, 3.1)), hash(vec2(uSeed, 7.7))) * 100.0;
+                float gn = vnoise(gp + gShift) * 0.7
+                         + vnoise(gp * 0.5 + gShift.yx + 31.7) * 0.3;
+                col += (gn - 0.5) * uGradeC.w * (1.0 - 0.55 * smoothstep(0.55, 1.0, y));
 
                 gl_FragColor = vec4(clamp(col, 0.0, 1.0), 1.0);
             }

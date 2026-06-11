@@ -56,6 +56,29 @@
             android:layout_height="match_parent"
             android:background="@android:color/transparent" />
 
+        <!-- Cinematic "Analyze Scene" chip (top centre of the preview).
+             Only visible in the CINEMATIC video preset. Record stays
+             locked until it has been pressed and the scene grade is ready;
+             after analysis it shows the detected mood. -->
+        <com.google.android.material.button.MaterialButton
+            android:id="@+id/analyze_scene_button"
+            style="@style/Widget.Material3.Button.TonalButton"
+            android:layout_width="wrap_content"
+            android:layout_height="40dp"
+            android:layout_gravity="top|center_horizontal"
+            android:layout_marginTop="16dp"
+            android:text="@string/analyze_scene"
+            android:textSize="14sp"
+            android:maxLines="1"
+            android:insetTop="0dp"
+            android:insetBottom="0dp"
+            android:minWidth="0dp"
+            android:minHeight="0dp"
+            android:paddingStart="20dp"
+            android:paddingEnd="20dp"
+            app:cornerRadius="20dp"
+            android:visibility="gone" />
+
         <!-- Capture overlay. Two states:
              - SAVING: just a semi-transparent dim over the live preview
                (no spinner, no text — minimal visual noise).

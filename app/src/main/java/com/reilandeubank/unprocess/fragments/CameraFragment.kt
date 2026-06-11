@@ -60,6 +60,8 @@ import com.reilandeubank.unprocess.filter.FilmFilter
 import com.reilandeubank.unprocess.filter.FilmSimulation
 import com.reilandeubank.unprocess.filter.AnalogLook
 import com.reilandeubank.unprocess.filter.AnalogLookRenderer
+import com.reilandeubank.unprocess.filter.CinematicGrade
+import com.reilandeubank.unprocess.filter.SceneAnalyzer
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
@@ -168,14 +170,24 @@ class CameraFragment : Fragment() {
     private var videoResolution: VideoResolution = VideoResolution.MAX
     private var videoFrameRate: Int = 30
 
-    /** Video looks. NORMAL is the direct (unprocessed) pipeline; SUPER8 and
-     *  VHS route the camera through [AnalogLookRenderer] for a procedural
-     *  Super-8 film / PAL-VHS camcorder look baked into the recording. */
-    private enum class VideoPreset { NORMAL, SUPER8, VHS }
+    /** Video looks. NORMAL is the direct (unprocessed) pipeline; SUPER8,
+     *  VHS and CINEMATIC route the camera through [AnalogLookRenderer] for
+     *  a look baked into the recording (procedural Super-8 film / PAL-VHS
+     *  camcorder / scene-adaptive cinema grade). */
+    private enum class VideoPreset { NORMAL, SUPER8, VHS, CINEMATIC }
     private var videoPreset: VideoPreset = VideoPreset.NORMAL
 
-    /** GL pipeline used only in SUPER8/VHS video mode; null otherwise. */
+    /** GL pipeline used only in SUPER8/VHS/CINEMATIC video mode; null otherwise. */
     private var analogRenderer: AnalogLookRenderer? = null
+
+    /** Scene-adaptive grade for the CINEMATIC preset, produced by the
+     *  "Analyze Scene" chip. Record stays locked while this is null —
+     *  deliberately NOT persisted: every session (and every lens/preset
+     *  change) starts with a fresh analysis of the actual scene. */
+    private var cinematicGrade: CinematicGrade? = null
+
+    /** True while a scene analysis is running (keeps the chip single-shot). */
+    private var isAnalyzingScene = false
 
     /** "Remaining film reel" countdown state (SUPER8 recording only). */
     private var reelHandler: Handler? = null
@@ -266,17 +278,23 @@ class CameraFragment : Fragment() {
         } catch (e: Exception) {
             VideoPreset.NORMAL
         }
-        // The analogue presets are defined by their native cadence — lock it in.
+        // The looks are defined by their native cadence — lock it in.
         when (videoPreset) {
             VideoPreset.SUPER8 -> videoFrameRate = 18
             VideoPreset.VHS -> videoFrameRate = 25
+            VideoPreset.CINEMATIC -> videoFrameRate = 24
             VideoPreset.NORMAL -> {}
         }
-        // The analogue presets are locked to 4:3. Apply that before the first
-        // updateViewfinderRatio() below so the container never starts out with
-        // a shape the camera pipeline will immediately abandon.
+        // The look presets have locked aspects (4:3 analogue, 16:9 cinema).
+        // Apply that before the first updateViewfinderRatio() below so the
+        // container never starts out with a shape the camera pipeline will
+        // immediately abandon.
         if (isVideoMode && videoPreset != VideoPreset.NORMAL) {
-            aspectRatio = AspectRatio.RATIO_4_3
+            aspectRatio = if (videoPreset == VideoPreset.CINEMATIC) {
+                AspectRatio.RATIO_16_9
+            } else {
+                AspectRatio.RATIO_4_3
+            }
         }
 
         val savedFilm = sharedPrefs.getString("pref_film_simulation", null)
@@ -469,14 +487,19 @@ class CameraFragment : Fragment() {
             videoPreset = when (videoPreset) {
                 VideoPreset.NORMAL -> VideoPreset.SUPER8
                 VideoPreset.SUPER8 -> VideoPreset.VHS
-                VideoPreset.VHS -> VideoPreset.NORMAL
+                VideoPreset.VHS -> VideoPreset.CINEMATIC
+                VideoPreset.CINEMATIC -> VideoPreset.NORMAL
             }
-            // The analogue presets force their cadence + a capped, encoder-safe
+            // Any preset change drops a previous scene analysis — the grade
+            // was derived for the framing and pipeline at analysis time.
+            invalidateSceneAnalysis()
+            // The look presets force their cadence + a capped, encoder-safe
             // resolution; leaving them restores a sensible frame-rate default.
             when (videoPreset) {
                 VideoPreset.SUPER8 -> coerceSuper8VideoSettings()
                 VideoPreset.VHS -> coerceVhsVideoSettings()
-                VideoPreset.NORMAL -> if (videoFrameRate == 18 || videoFrameRate == 25) {
+                VideoPreset.CINEMATIC -> coerceCinematicVideoSettings()
+                VideoPreset.NORMAL -> if (videoFrameRate == 18 || videoFrameRate == 24 || videoFrameRate == 25) {
                     videoFrameRate = if (30 in getSupportedVideoFramerates()) 30 else getSupportedVideoFramerates().firstOrNull() ?: 30
                 }
             }
@@ -509,6 +532,10 @@ class CameraFragment : Fragment() {
 
         fragmentCameraBinding.galleryButton?.setOnClickListener {
             openRecentPhoto()
+        }
+
+        fragmentCameraBinding.analyzeSceneButton?.setOnClickListener {
+            analyzeScene()
         }
 
         // Capture button — registered ONCE. It does double duty:
@@ -954,8 +981,9 @@ class CameraFragment : Fragment() {
 
         val videoSettingsAvailable = !isProcessing && !isRecordingVideo && !isShowingDone && isVideoMode
 
-        // SUPER8/VHS lock both resolution (encoder-safe 480p) and frame rate
-        // (18/25 fps), so those toggles are disabled while a preset is active.
+        // The look presets lock both resolution (encoder-safe 480p analogue /
+        // 1080p cinema) and frame rate (18/25/24 fps), so those toggles are
+        // disabled while a preset is active.
         val normalVideoSettings = videoSettingsAvailable && videoPreset == VideoPreset.NORMAL
         binding.resolutionToggle?.isEnabled = normalVideoSettings
         setButtonActiveStyle(binding.resolutionToggle, normalVideoSettings)
@@ -969,6 +997,7 @@ class CameraFragment : Fragment() {
             VideoPreset.NORMAL -> getString(R.string.preset_normal)
             VideoPreset.SUPER8 -> getString(R.string.preset_super8)
             VideoPreset.VHS -> getString(R.string.preset_vhs)
+            VideoPreset.CINEMATIC -> getString(R.string.preset_cinematic)
         }
         binding.presetToggle?.text = "Film Mode $presetText"
 
@@ -1005,6 +1034,32 @@ class CameraFragment : Fragment() {
         updateMovieToggleUI()
         updateModeToggleUI()
         updateFilterUI()
+        updateAnalyzeSceneUI()
+    }
+
+    /**
+     * The "Analyze Scene" chip at the top centre of the preview. Visible only
+     * in the CINEMATIC preset; highlighted (primary colour) while analysis is
+     * still pending — it is THE call to action there — and quiet once a grade
+     * is locked in, when it shows the detected mood instead.
+     */
+    private fun updateAnalyzeSceneUI() {
+        val binding = _fragmentCameraBinding ?: return
+        val button = binding.analyzeSceneButton ?: return
+        if (!isCinematic() || isShowingDone) {
+            button.visibility = View.GONE
+            return
+        }
+        button.visibility = View.VISIBLE
+        val clickable = !isRecordingVideo && !isProcessing && !isAnalyzingScene
+        button.isEnabled = clickable
+        val grade = cinematicGrade
+        button.text = when {
+            isAnalyzingScene -> getString(R.string.analyze_scene_running)
+            grade != null -> getString(R.string.analyze_scene_done, grade.moodName)
+            else -> getString(R.string.analyze_scene)
+        }
+        setButtonActiveStyle(button, clickable && grade == null)
     }
 
     private fun updateFilterUI() {
@@ -1048,6 +1103,9 @@ class CameraFragment : Fragment() {
     private fun toggleCameraVideoMode(toVideoMode: Boolean) {
         if (isRecordingVideo) return
         isVideoMode = toVideoMode
+        // Switching photo ↔ video changes pipeline and framing — a cinematic
+        // grade from before the switch no longer matches the scene.
+        invalidateSceneAnalysis()
         if (isVideoMode) {
             savedPhotoFilmSimulation = filmSimulation
             filmSimulation = FilmSimulation.NORMAL
@@ -1055,6 +1113,7 @@ class CameraFragment : Fragment() {
             when (videoPreset) {
                 VideoPreset.SUPER8 -> coerceSuper8VideoSettings()
                 VideoPreset.VHS -> coerceVhsVideoSettings()
+                VideoPreset.CINEMATIC -> coerceCinematicVideoSettings()
                 VideoPreset.NORMAL -> {}
             }
         } else {
@@ -1127,8 +1186,16 @@ class CameraFragment : Fragment() {
     /** True when the VHS GL pipeline should be active. */
     private fun isVhs(): Boolean = isVideoMode && videoPreset == VideoPreset.VHS
 
+    /** True when the CINEMATIC GL pipeline should be active. */
+    private fun isCinematic(): Boolean = isVideoMode && videoPreset == VideoPreset.CINEMATIC
+
     /** True when any GL look (camera → renderer → encoder) is active. */
-    private fun usesGlPipeline(): Boolean = isSuper8() || isVhs()
+    private fun usesGlPipeline(): Boolean = isSuper8() || isVhs() || isCinematic()
+
+    /** True while the CINEMATIC preset has no scene grade yet — Record is
+     *  greyed out until [analyzeScene] has produced one. */
+    private fun cinematicRecordLocked(): Boolean =
+        isCinematic() && cinematicGrade == null && !isRecordingVideo && !isShowingDone
 
     /**
      * Super-8 is defined by 18 fps and is inherently low-resolution. We also
@@ -1156,6 +1223,83 @@ class CameraFragment : Fragment() {
         videoFrameRate = 25
         aspectRatio = AspectRatio.RATIO_4_3
         videoResolution = VideoResolution.SD_480P
+    }
+
+    /**
+     * Cinema is defined by 24 fps and a widescreen frame. 1080p is the sweet
+     * spot: encoder-safe on every device (unlike the sensor's MAX size, see
+     * [coerceSuper8VideoSettings]) while keeping the grade's softness and
+     * grain looking like glass+film rather than upscaled video.
+     */
+    private fun coerceCinematicVideoSettings() {
+        videoFrameRate = 24
+        aspectRatio = AspectRatio.RATIO_16_9
+        videoResolution = VideoResolution.FHD_1080P
+    }
+
+    /**
+     * Drops the current scene analysis. Called whenever lens, preset or
+     * photo/video mode changes — the grade was computed for a specific
+     * framing and look, and Record re-locks until the user analyzes again.
+     */
+    private fun invalidateSceneAnalysis() {
+        cinematicGrade = null
+        updateAnalyzeSceneUI()
+        updateCaptureButtonForState()
+    }
+
+    /**
+     * "Analyze Scene": grabs one frame from the live viewfinder (PixelCopy —
+     * the preview is the ungraded camera image, exactly what we want to
+     * measure), runs [SceneAnalyzer] off the main thread, pushes the
+     * resulting grade into the GL renderer and unlocks Record. The result is
+     * discarded if the user switched lens/preset/mode while it was running.
+     */
+    private fun analyzeScene() {
+        if (!isCinematic() || isRecordingVideo || isProcessing || isAnalyzingScene || isShowingDone) return
+        val presetAtStart = videoPreset
+        val cameraAtStart = currentCameraId
+        isAnalyzingScene = true
+        updateAnalyzeSceneUI()
+        _fragmentCameraBinding?.analyzeSceneButton
+            ?.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
+
+        viewLifecycleOwner.lifecycleScope.launch {
+            var grade: CinematicGrade? = null
+            try {
+                val frame = captureSurfaceBitmap(fragmentCameraBinding.viewFinder)
+                if (frame != null) {
+                    grade = withContext(Dispatchers.Default) {
+                        try {
+                            SceneAnalyzer.analyze(frame)
+                        } finally {
+                            frame.recycle()
+                        }
+                    }
+                }
+            } catch (exc: Exception) {
+                Log.e(TAG, "Scene analysis failed", exc)
+            }
+            isAnalyzingScene = false
+            val binding = _fragmentCameraBinding ?: return@launch
+            // Stale result — the world the grade was computed for is gone.
+            if (videoPreset != presetAtStart || currentCameraId != cameraAtStart || !isVideoMode) {
+                updateAnalyzeSceneUI()
+                return@launch
+            }
+            if (grade != null) {
+                cinematicGrade = grade
+                analogRenderer?.setCinematicGrade(grade.toUniforms())
+                Log.d(TAG, "Cinematic grade ready: ${grade.moodName}")
+                if (!isProcessing && !isRecordingVideo && !isCameraInitializing) {
+                    binding.captureButton.isEnabled = true
+                }
+            } else {
+                Toast.makeText(requireContext(), "Scene analysis failed — try again", Toast.LENGTH_SHORT).show()
+            }
+            updateAnalyzeSceneUI()
+            updateCaptureButtonForState()
+        }
     }
 
     /**
@@ -1388,6 +1532,12 @@ class CameraFragment : Fragment() {
                 setAudioEncodingBitRate(32000)
                 setAudioChannels(1)
                 setAudioSamplingRate(16000)
+            } else if (isCinematic()) {
+                // Cinema audio: stereo 48 kHz AAC at a healthy bitrate — the
+                // CamcorderProfile default envelope, supported everywhere.
+                setAudioEncodingBitRate(192000)
+                setAudioChannels(2)
+                setAudioSamplingRate(48000)
             } else {
                 setAudioEncodingBitRate(96000)
                 setAudioChannels(1)
@@ -1400,7 +1550,11 @@ class CameraFragment : Fragment() {
 
     private fun startRecordingVideo() {
         if (!::session.isInitialized) return
-        
+        // CINEMATIC records only with a scene grade — the button is disabled
+        // in that state, this is a belt-and-braces guard for indirect paths
+        // (e.g. triggerCapture).
+        if (cinematicRecordLocked()) return
+
         viewLifecycleOwner.lifecycleScope.launch {
             try {
                 fragmentCameraBinding.captureButton.isEnabled = false
@@ -2134,8 +2288,16 @@ class CameraFragment : Fragment() {
                 else -> R.string.capture
             }
         )
-        
-        if (isProcessing) {
+
+        // In CINEMATIC, Record stays locked (grey + disabled) until the scene
+        // has been analyzed — the whole point of the preset is recording with
+        // a scene-matched grade, never without one. Only ever DISABLE here;
+        // re-enabling is owned by the analysis/init flows.
+        if (cinematicRecordLocked()) {
+            button.isEnabled = false
+        }
+
+        if (isProcessing || cinematicRecordLocked()) {
             button.backgroundTintList = ColorStateList.valueOf(getSecondaryContainerColor())
             button.setTextColor(getOnSecondaryContainerColor())
             button.iconTint = ColorStateList.valueOf(getOnSecondaryContainerColor())
@@ -2235,7 +2397,9 @@ class CameraFragment : Fragment() {
     private fun reEnableUI() {
         Log.d(TAG, "reEnableUI() called, setting isCameraInitializing to false")
         isCameraInitializing = false
-        fragmentCameraBinding.captureButton.isEnabled = true
+        // Capture comes back except while CINEMATIC still waits for its
+        // scene analysis (Record is gated on the grade there).
+        fragmentCameraBinding.captureButton.isEnabled = !cinematicRecordLocked()
         val count = fragmentCameraBinding.lensSelectorContainer?.childCount ?: 0
         for (i in 0 until count) {
             fragmentCameraBinding.lensSelectorContainer?.getChildAt(i)?.isEnabled = true
@@ -2265,7 +2429,11 @@ class CameraFragment : Fragment() {
         
         Log.d(TAG, "Switching camera to $newId")
         currentCameraId = newId
-        
+
+        // A lens switch changes field of view and exposure behaviour — any
+        // cinematic scene grade no longer matches what the camera sees.
+        invalidateSceneAnalysis()
+
         // Update highlight immediately for responsive feel
         updateLensHighlight()
 
@@ -2361,7 +2529,11 @@ class CameraFragment : Fragment() {
         // the encoder and fail it.
         if (usesGlPipeline()) {
             val before = videoResolution to videoFrameRate
-            if (isSuper8()) coerceSuper8VideoSettings() else coerceVhsVideoSettings()
+            when {
+                isSuper8() -> coerceSuper8VideoSettings()
+                isVhs() -> coerceVhsVideoSettings()
+                else -> coerceCinematicVideoSettings()
+            }
             if (videoResolution to videoFrameRate != before) settingsChanged = true
         }
         if (settingsChanged) {
@@ -2475,10 +2647,10 @@ class CameraFragment : Fragment() {
                         aspectRatio = captureRatio
                     )
 
-                    // SUPER8/VHS insert the GL renderer between the camera and the
-                    // encoder (the camera writes to the renderer's SurfaceTexture,
-                    // the renderer bakes the look into the recording). The
-                    // on-screen preview stays a plain camera preview.
+                    // SUPER8/VHS/CINEMATIC insert the GL renderer between the
+                    // camera and the encoder (the camera writes to the renderer's
+                    // SurfaceTexture, the renderer bakes the look into the
+                    // recording). The on-screen preview stays a plain camera preview.
                     //
                     // IMPORTANT: capture into the SurfaceTexture at the FOV-correct
                     // preview size (e.g. 1440x1080), NOT the small encoder size
@@ -2493,7 +2665,11 @@ class CameraFragment : Fragment() {
                     if (usesGlPipeline()) {
                         val capW = computedPreviewSize.width
                         val capH = computedPreviewSize.height
-                        val look = if (isSuper8()) AnalogLook.SUPER8 else AnalogLook.VHS
+                        val look = when {
+                            isSuper8() -> AnalogLook.SUPER8
+                            isVhs() -> AnalogLook.VHS
+                            else -> AnalogLook.CINEMATIC
+                        }
                         val existing = analogRenderer
                         if (existing == null ||
                             existing.look != look ||
@@ -2508,6 +2684,11 @@ class CameraFragment : Fragment() {
                             videoPreset = VideoPreset.NORMAL
                             updateSettingsUI()
                             saveSettings()
+                        } else if (look == AnalogLook.CINEMATIC) {
+                            // Re-apply an existing scene grade after the renderer
+                            // was (re)created — e.g. on a session rebuild between
+                            // analysis and recording.
+                            cinematicGrade?.let { analogRenderer?.setCinematicGrade(it.toUniforms()) }
                         }
                     } else {
                         analogRenderer?.release()

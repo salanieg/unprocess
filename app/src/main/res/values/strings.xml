@@ -30,6 +30,11 @@
     <string name="preset_normal">Normal</string>
     <string name="preset_super8">Super8</string>
     <string name="preset_vhs">VHS</string>
+    <string name="preset_cinematic">Cinematic</string>
+    <!-- Cinematic scene analysis. %1$s in analyze_scene_done is the detected mood, e.g. "Golden Hour". -->
+    <string name="analyze_scene">Analyze Scene</string>
+    <string name="analyze_scene_running">Analyzing…</string>
+    <string name="analyze_scene_done">✓ %1$s</string>
     <!-- Super8 film reel countdown. %1$s is the remaining time, e.g. "3:20". -->
     <string name="film_reel_remaining">Remaining film reel: %1$s</string>
 </resources>
