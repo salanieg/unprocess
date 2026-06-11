@@ -246,9 +246,11 @@ class CameraFragment : Fragment() {
             AspectRatio.RATIO_4_3
         }
 
-        aspectRatio = if (isVideoMode) videoAspectRatio else photoAspectRatio
         flashMode = sharedPrefs.getInt("pref_flash_mode", CaptureRequest.CONTROL_AE_MODE_ON)
         isVideoMode = sharedPrefs.getBoolean("pref_is_video_mode", false)
+        // Must come AFTER isVideoMode is loaded — reading it earlier made a
+        // cold start in video mode lay out with the photo aspect ratio.
+        aspectRatio = if (isVideoMode) videoAspectRatio else photoAspectRatio
         
         videoFrameRate = sharedPrefs.getInt("pref_video_fps", 30)
         val savedResName = sharedPrefs.getString("pref_video_resolution", VideoResolution.MAX.name)
@@ -269,6 +271,12 @@ class CameraFragment : Fragment() {
             VideoPreset.SUPER8 -> videoFrameRate = 18
             VideoPreset.VHS -> videoFrameRate = 25
             VideoPreset.NORMAL -> {}
+        }
+        // The analogue presets are locked to 4:3. Apply that before the first
+        // updateViewfinderRatio() below so the container never starts out with
+        // a shape the camera pipeline will immediately abandon.
+        if (isVideoMode && videoPreset != VideoPreset.NORMAL) {
+            aspectRatio = AspectRatio.RATIO_4_3
         }
 
         val savedFilm = sharedPrefs.getString("pref_film_simulation", null)
@@ -1804,6 +1812,52 @@ class CameraFragment : Fragment() {
         }
     }
 
+    /**
+     * Suspends until the viewfinder surface actually has the fixed buffer size
+     * requested via [AutoFitSurfaceView.setBufferSize]. SurfaceHolder.setFixedSize
+     * is applied on the next layout traversal, so callers that need the final
+     * surface geometry (capture-session creation) must not read the surface
+     * before this returns. Returns immediately when the size already matches;
+     * the timeout is only a safety net so camera init can never hang on layout.
+     */
+    private suspend fun awaitViewfinderBufferSize(width: Int, height: Int) {
+        val holder = fragmentCameraBinding.viewFinder.holder
+        fun matches(): Boolean {
+            val frame = holder.surfaceFrame
+            return frame.width() == width && frame.height() == height
+        }
+        if (matches()) return
+        var callback: SurfaceHolder.Callback? = null
+        try {
+            val reached = kotlinx.coroutines.withTimeoutOrNull(500L) {
+                suspendCancellableCoroutine<Unit> { cont ->
+                    val cb = object : SurfaceHolder.Callback {
+                        override fun surfaceCreated(holder: SurfaceHolder) = Unit
+                        override fun surfaceDestroyed(holder: SurfaceHolder) = Unit
+                        override fun surfaceChanged(
+                            holder: SurfaceHolder,
+                            format: Int,
+                            w: Int,
+                            h: Int
+                        ) {
+                            if (w == width && h == height && cont.isActive) cont.resume(Unit)
+                        }
+                    }
+                    callback = cb
+                    holder.addCallback(cb)
+                    // The traversal may have applied the size between the check
+                    // above and registering the callback.
+                    if (matches() && cont.isActive) cont.resume(Unit)
+                }
+            }
+            if (reached == null) {
+                Log.w(TAG, "Viewfinder surface did not reach ${width}x$height in time; continuing")
+            }
+        } finally {
+            callback?.let { holder.removeCallback(it) }
+        }
+    }
+
     // -------- Capture progress UI --------
 
     /** Bitmap currently shown in the Done overlay. Recycled when we leave
@@ -2517,6 +2571,16 @@ class CameraFragment : Fragment() {
                 val facingFrontPreview = characteristics.get(CameraCharacteristics.LENS_FACING) ==
                         CameraCharacteristics.LENS_FACING_FRONT
                 Log.d(TAG, "PREVIEW DIAG | camera=$currentCameraId facing=${if (facingFrontPreview) "FRONT" else "BACK"} sensor=${sensorOrientation}° deviceDisplay=${deviceRotation}° swap=$needsSwap | buffer=${previewSize.width}x${previewSize.height} viewAspect=$displayWidth:$displayHeight")
+
+                // setFixedSize() above only takes effect on the next layout
+                // traversal, but OutputConfiguration reads the surface size the
+                // moment it is constructed. If session creation wins that race
+                // (common on cold start with a warm camera service), the stream
+                // gets configured for the stale layout-sized surface and the
+                // preview is displayed stretched until the next re-init. Wait —
+                // event-driven, no fixed settle delay — for the surface to
+                // report the requested buffer size before building the outputs.
+                awaitViewfinderBufferSize(previewSize.width, previewSize.height)
 
                 // The "record" target for video: in SUPER8/VHS it's the renderer's
                 // SurfaceTexture (camera → GL → encoder); in NORMAL it's the
