@@ -119,11 +119,8 @@
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
                 android:layout_marginBottom="6dp"
-<<<<<<< HEAD
                 android:maxLines="1"
-=======
                 android:fontFamily="sans-serif"
->>>>>>> a1d7afdfb4263de59dc81f1cc6dab6fe4286b16f
                 android:shadowColor="#CC000000"
                 android:shadowDx="0"
                 android:shadowDy="1"
