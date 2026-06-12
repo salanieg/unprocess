@@ -123,8 +123,26 @@ class AnalogLookRenderer private constructor(
     )
 
     private var frameCount = 0L
-    /** Timestamp (ns) of the last frame we actually rendered, for fps pacing. */
-    private var lastDrawTs = 0L
+    /**
+     * Next due time (ns) on the frame grid. Pacing against this grid —
+     * instead of against the timestamp of the last drawn frame — is what
+     * keeps the cadence smooth: camera delivery always jitters by a few
+     * ms, and measuring from the last draw turned that jitter into spurious
+     * drops (~6% of frames), each one an 83 ms hole the eye reads as judder.
+     */
+    private var nextDueNs = 0L
+    /**
+     * Adaptive estimate of the camera's true inter-frame interval (ns),
+     * floored at the look's nominal cadence. OEM HALs routinely run a
+     * "24 fps" mode at ~23 fps; forcing the nominal grid onto such a camera
+     * punches an 80+ ms hole into the timeline once a second. Following the
+     * measured cadence keeps the file perfectly even at whatever the sensor
+     * honestly delivers, while a camera running FASTER than the look is
+     * still paced down to the look's fps.
+     */
+    private var emaIntervalNs = frameIntervalNs
+    /** Arrival time of the previous camera frame while recording. */
+    private var lastArrivalNs = 0L
     @Volatile private var released = false
 
     /** The camera-facing input surface, or null if GL init failed. Stable for
@@ -185,7 +203,9 @@ class AnalogLookRenderer private constructor(
                     "startEncoder: requested=${videoWidth}x$videoHeight " +
                         "actual EGL surface=${encoderSurfW}x$encoderSurfH rot=$rotationDeg",
                 )
-                lastDrawTs = 0L
+                nextDueNs = 0L
+                lastArrivalNs = 0L
+                emaIntervalNs = frameIntervalNs
                 recording = true
             } catch (t: Throwable) {
                 Log.e(TAG, "startEncoder failed", t)
@@ -291,12 +311,34 @@ class AnalogLookRenderer private constructor(
             // unplayable file. nanoTime matches the audio clock and keeps A/V
             // in sync. We also pace to the look's fps off the same wall clock.
             val nowNs = System.nanoTime()
-            if (lastDrawTs > 0 &&
-                nowNs - lastDrawTs < (frameIntervalNs * 0.85).toLong()
-            ) {
-                return
+            // Track the camera's true cadence: EMA over inter-arrival times,
+            // outlier-gated so bunched deliveries and stalls don't skew it.
+            if (lastArrivalNs > 0L) {
+                val delta = (nowNs - lastArrivalNs).toDouble()
+                if (delta > frameIntervalNs * 0.5 && delta < frameIntervalNs * 2.5) {
+                    emaIntervalNs = (emaIntervalNs * 0.85 + delta * 0.15)
+                        .coerceIn(frameIntervalNs, frameIntervalNs * 1.25)
+                }
             }
-            lastDrawTs = nowNs
+            lastArrivalNs = nowNs
+            // Re-anchor the cadence grid on the first frame and after stalls
+            // (camera hiccup, >1 frame late) so the schedule never demands a
+            // catch-up burst.
+            if (nextDueNs == 0L || nowNs - nextDueNs > emaIntervalNs.toLong()) {
+                nextDueNs = nowNs
+            }
+            // Drop only frames clearly ahead of their grid slot. When the
+            // camera runs at (or below) the look's fps this encodes EVERY
+            // frame; when it runs faster the surplus is shed evenly instead
+            // of in random pairs.
+            if (nowNs < nextDueNs - (emaIntervalNs * 0.45).toLong()) return
+            // Stamp the frame with its GRID SLOT, not the draw time: GL/
+            // encoder backpressure bunches draw times by 10–20 ms, and at
+            // 24 fps that PTS jitter alone reads as judder. The grid is
+            // anchored to nanoTime arrivals (≤1 frame off wall clock), so
+            // A/V sync is untouched while playback becomes perfectly even.
+            val ptsNs = nextDueNs
+            nextDueNs += emaIntervalNs.toLong()
             frameCount++
 
             makeCurrent(encoderEgl)
@@ -306,7 +348,7 @@ class AnalogLookRenderer private constructor(
             val ew = if (encoderSurfW > 0) encoderSurfW else videoWidth
             val eh = if (encoderSurfH > 0) encoderSurfH else videoHeight
             render(ew, eh, encoderMvp)
-            setPresentationTime(encoderEgl, nowNs)
+            setPresentationTime(encoderEgl, ptsNs)
             EGL14.eglSwapBuffers(eglDisplay, encoderEgl)
             // Return to the pbuffer so the encoder surface isn't left current
             // (it may be torn down by stopEncoder() at any time).
@@ -1003,11 +1045,11 @@ class AnalogLookRenderer private constructor(
          * Layout matches `CinematicGrade.toUniforms()`.
          */
         private val NEUTRAL_CINEMATIC_GRADE = floatArrayOf(
-            0f, 0.22f, 0.16f, 0.50f,
-            1f, 1f, 1.04f, 0.10f,
-            -0.014f, 0.003f, 0.022f,
-            0.020f, 0.010f, -0.014f,
-            0.45f, 0.38f, 0.24f, 0.045f,
+            0f, 0.34f, 0.18f, 0.58f,
+            1.05f, 0.94f, 1.14f, 0.16f,
+            -0.044f, 0.010f, 0.068f,
+            0.062f, 0.031f, -0.044f,
+            0.58f, 0.42f, 0.32f, 0.050f,
         )
 
         /**
@@ -1033,8 +1075,10 @@ class AnalogLookRenderer private constructor(
          *  5. Colour: split toning (uShadowTint/uHighlightTint, near-zero-
          *     mean so luma stays honest), then vibrance-weighted saturation
          *     with skin protection — faces never go teal or oversaturated.
-         *  6. Finish: gentle vignette and fine 35mm-ish grain (far subtler
-         *     than Super-8), both grade-controlled.
+         *  6. Finish: gentle vignette, fine 35mm-ish grain (far subtler
+         *     than Super-8), and a 2.35:1 cinemascope letterbox painted in
+         *     video space (always horizontal in the file, like the VHS
+         *     shader's scanlines).
          *
          * Same mediump-safe hash/noise as the other looks; everything stays
          * in [0,1]-adjacent ranges, so it runs artefact-free on every GPU
@@ -1093,23 +1137,25 @@ class AnalogLookRenderer private constructor(
                 for (int i = 0; i < 6; i++) {
                     float ang = float(i) * 1.0471976 + 0.5235988;
                     vec2 d = vec2(cos(ang), sin(ang));
-                    blurAcc += texture2D(sTexture, clamp(uv + d * px * 1.5, 0.0, 1.0)).rgb;
-                    vec3 h = texture2D(sTexture, clamp(uv + d * px * 7.0, 0.0, 1.0)).rgb;
-                    glowAcc += h * smoothstep(0.62, 0.95, lum(h));
+                    blurAcc += texture2D(sTexture, clamp(uv + d * px * 2.0, 0.0, 1.0)).rgb;
+                    vec3 h = texture2D(sTexture, clamp(uv + d * px * 9.0, 0.0, 1.0)).rgb;
+                    glowAcc += h * smoothstep(0.58, 0.92, lum(h));
                 }
                 blurAcc /= 6.0;
                 glowAcc /= 6.0;
 
                 // Softness: fine-detail diffusion, well below "out of focus".
-                col = mix(col, blurAcc, uGradeC.y * 0.55);
+                col = mix(col, blurAcc, uGradeC.y * 0.65);
 
                 // --- Linear light: exposure, white balance, bloom ---
                 vec3 lin = col * col;
                 float gain = exp2(uGradeA.x);
                 lin *= gain;
                 lin *= vec3(uGradeB.x, 1.0, uGradeB.y);
-                vec3 glow = glowAcc * glowAcc * gain;
-                lin += glow * uGradeC.x * 0.5;
+                // Slightly warm glow — diffusion filters scatter the long
+                // wavelengths a touch more, which is what reads as "film".
+                vec3 glow = glowAcc * glowAcc * gain * vec3(1.06, 0.98, 0.88);
+                lin += glow * uGradeC.x * 0.85;
                 lin = max(lin, 0.0);
 
                 col = sqrt(lin);
@@ -1130,9 +1176,12 @@ class AnalogLookRenderer private constructor(
                 col = mix(col, s, uGradeA.y);
 
                 // --- Split-toned colour grade ---
-                float y = lum(col);
-                float shW = (1.0 - y) * (1.0 - y);
-                float hiW = y * y;
+                // Exponent 1.6 (instead of 2.0) lets the tones reach into
+                // the midtones — that wider colour separation is what reads
+                // as a professional grade rather than a tinted photo filter.
+                float y = clamp(lum(col), 0.0, 1.0);
+                float shW = pow(1.0 - y, 1.6);
+                float hiW = pow(y, 1.6);
                 col += uShadowTint * shW + uHighlightTint * hiW;
 
                 // --- Saturation/vibrance with skin protection ---
@@ -1142,10 +1191,11 @@ class AnalogLookRenderer private constructor(
                 float satNow = (mx <= 0.0) ? 0.0 : (mx - mn) / mx;
                 float factor = uGradeB.z + uGradeB.w * (1.0 - satNow);
                 // Skin-like pixels (r > g > b) keep a near-neutral factor so
-                // faces never pick up the push meant for the scenery.
+                // faces never pick up the push meant for the scenery —
+                // pulled harder now that the surrounding grade is stronger.
                 float skinW = clamp((col.r - col.g) * 5.0, 0.0, 1.0)
                             * clamp((col.g - col.b) * 5.0, 0.0, 1.0);
-                factor = mix(factor, min(factor, 1.04), skinW * 0.75);
+                factor = mix(factor, min(factor, 1.04), skinW * 0.85);
                 col = mix(vec3(y), col, factor);
 
                 // --- Vignette: wide and gentle, draws the eye inward ---
@@ -1158,6 +1208,14 @@ class AnalogLookRenderer private constructor(
                 float gn = vnoise(gp + gShift) * 0.7
                          + vnoise(gp * 0.5 + gShift.yx + 31.7) * 0.3;
                 col += (gn - 0.5) * uGradeC.w * (1.0 - 0.55 * smoothstep(0.55, 1.0, y));
+
+                // --- Cinemascope letterbox: 2.35:1 inside the 16:9 frame ---
+                // Painted in VIDEO space (gl_FragCoord maps 1:1 onto the
+                // encoded file), so the bars stay horizontal in the final
+                // clip in every device orientation.
+                float vy = gl_FragCoord.y / uResolution.y;
+                col *= smoothstep(0.1205, 0.1235, vy)
+                     * (1.0 - smoothstep(0.8765, 0.8795, vy));
 
                 gl_FragColor = vec4(clamp(col, 0.0, 1.0), 1.0);
             }

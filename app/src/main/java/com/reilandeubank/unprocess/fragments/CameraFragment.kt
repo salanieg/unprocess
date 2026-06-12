@@ -61,7 +61,11 @@ import com.reilandeubank.unprocess.filter.FilmSimulation
 import com.reilandeubank.unprocess.filter.AnalogLook
 import com.reilandeubank.unprocess.filter.AnalogLookRenderer
 import com.reilandeubank.unprocess.filter.CinematicGrade
+import com.reilandeubank.unprocess.filter.CinematicMood
 import com.reilandeubank.unprocess.filter.SceneAnalyzer
+import com.reilandeubank.unprocess.video.Mp4Stitcher
+import android.widget.ImageView
+import android.widget.TextView
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
@@ -171,23 +175,91 @@ class CameraFragment : Fragment() {
     private var videoFrameRate: Int = 30
 
     /** Video looks. NORMAL is the direct (unprocessed) pipeline; SUPER8,
-     *  VHS and CINEMATIC route the camera through [AnalogLookRenderer] for
+     *  VHS and NARRATION route the camera through [AnalogLookRenderer] for
      *  a look baked into the recording (procedural Super-8 film / PAL-VHS
-     *  camcorder / scene-adaptive cinema grade). */
-    private enum class VideoPreset { NORMAL, SUPER8, VHS, CINEMATIC }
+     *  camcorder / scene-adaptive cinema grade). NARRATION additionally
+     *  records in segments via Cut/Continue/Save. */
+    private enum class VideoPreset { NORMAL, SUPER8, VHS, NARRATION }
     private var videoPreset: VideoPreset = VideoPreset.NORMAL
 
     /** GL pipeline used only in SUPER8/VHS/CINEMATIC video mode; null otherwise. */
     private var analogRenderer: AnalogLookRenderer? = null
 
-    /** Scene-adaptive grade for the CINEMATIC preset, produced by the
-     *  "Analyze Scene" chip. Record stays locked while this is null —
-     *  deliberately NOT persisted: every session (and every lens/preset
-     *  change) starts with a fresh analysis of the actual scene. */
+    /** The grade last pushed into the renderer (computed fresh from the
+     *  live preview at every Record press); kept so a renderer re-creation
+     *  mid-session can re-apply it. */
     private var cinematicGrade: CinematicGrade? = null
 
-    /** True while a scene analysis is running (keeps the chip single-shot). */
-    private var isAnalyzingScene = false
+    /** Active cinematic look, user-selectable via the Select Scene menu.
+     *  Blockbuster is the standing default — deliberately NOT persisted,
+     *  every session starts there. */
+    private var cinematicMood: CinematicMood = CinematicMood.BLOCKBUSTER
+
+    /** True once the user explicitly picked (or had recommended) a mood —
+     *  flips the chip from the "Select Scene" call-to-action to the name. */
+    private var cinematicMoodChosen = false
+
+    /** Cached Select-Scene tiles: the parrot base image re-graded with
+     *  each mood's baseline. Built lazily on first menu open. */
+    private var sceneTileCache: Map<CinematicMood, Bitmap>? = null
+
+    // -------- Narration segment recording (Cut / Continue / Save) --------
+
+    /** Directory holding this recording session's finished segment files.
+     *  Lives in app-external storage so a crash leaves the segments intact
+     *  for [recoverNarrationSegments] on the next launch. */
+    private var narrationSessionDir: File? = null
+
+    /** Finalized (and currently-recording) segment files, in order. */
+    private val narrationSegments = mutableListOf<File>()
+    private var narrationSegmentIndex = 0
+
+    /** True between Cut and Continue — the session is alive but no
+     *  recorder is running. */
+    private var isNarrationPaused = false
+
+    /** Recording parameters captured at Record press so every segment is
+     *  encoded identically (a hard requirement for lossless stitching). */
+    private var narrationVideoSize: android.util.Size? = null
+    private var narrationVideoRotation = 0
+    private var narrationEncoderRotation = 0
+
+    /** Latest AE-chosen exposure/ISO seen in preview capture results — the
+     *  metering source for the locked filmic exposure at Record press.
+     *  Written on the camera thread, read on the main thread. */
+    @Volatile private var lastAeExposureNs = 0L
+    @Volatile private var lastAeIso = 0
+
+    /** Manual (shutter ns, ISO) pair locked in for the duration of a
+     *  CINEMATIC recording; null = plain auto-exposure. */
+    private var cinematicManualExposure: Pair<Long, Int>? = null
+
+    /** Last device rotation (CW) — re-applied to buttons whose text (and
+     *  thus fitting scale) changes while the phone is held sideways. */
+    private var lastDeviceCw = 0
+
+    /** False until the mode thumb was positioned once — the first placement
+     *  must be instant, not a cold-start slide animation. */
+    private var modeThumbPlaced = false
+
+    /** Harvests the AE telemetry [computeCinematicExposure] needs. Attached
+     *  to the preview repeating request only in CINEMATIC (no-op cost). */
+    private val aeMeterCallback = object : CameraCaptureSession.CaptureCallback() {
+        override fun onCaptureCompleted(
+            session: CameraCaptureSession,
+            request: CaptureRequest,
+            result: TotalCaptureResult,
+        ) {
+            result.get(CaptureResult.SENSOR_EXPOSURE_TIME)?.let { lastAeExposureNs = it }
+            result.get(CaptureResult.SENSOR_SENSITIVITY)?.let { lastAeIso = it }
+        }
+    }
+
+    /** Capture callback for preview repeating requests: AE metering in
+     *  CINEMATIC (only while AE is actually live — a locked manual clip
+     *  would just echo its own fixed values back), nothing otherwise. */
+    private fun previewMeterCallback(): CameraCaptureSession.CaptureCallback? =
+        if (isNarration() && cinematicManualExposure == null) aeMeterCallback else null
 
     /** "Remaining film reel" countdown state (SUPER8 recording only). */
     private var reelHandler: Handler? = null
@@ -273,16 +345,20 @@ class CameraFragment : Fragment() {
         }
 
         val savedPreset = sharedPrefs.getString("pref_video_preset", VideoPreset.NORMAL.name)
-        videoPreset = try {
-            VideoPreset.valueOf(savedPreset ?: VideoPreset.NORMAL.name)
-        } catch (e: Exception) {
-            VideoPreset.NORMAL
+        videoPreset = when (savedPreset) {
+            // Pre-rename installs persisted the old preset name.
+            "CINEMATIC" -> VideoPreset.NARRATION
+            else -> try {
+                VideoPreset.valueOf(savedPreset ?: VideoPreset.NORMAL.name)
+            } catch (e: Exception) {
+                VideoPreset.NORMAL
+            }
         }
         // The looks are defined by their native cadence — lock it in.
         when (videoPreset) {
             VideoPreset.SUPER8 -> videoFrameRate = 18
             VideoPreset.VHS -> videoFrameRate = 25
-            VideoPreset.CINEMATIC -> videoFrameRate = 24
+            VideoPreset.NARRATION -> videoFrameRate = 24
             VideoPreset.NORMAL -> {}
         }
         // The look presets have locked aspects (4:3 analogue, 16:9 cinema).
@@ -290,7 +366,7 @@ class CameraFragment : Fragment() {
         // container never starts out with a shape the camera pipeline will
         // immediately abandon.
         if (isVideoMode && videoPreset != VideoPreset.NORMAL) {
-            aspectRatio = if (videoPreset == VideoPreset.CINEMATIC) {
+            aspectRatio = if (videoPreset == VideoPreset.NARRATION) {
                 AspectRatio.RATIO_16_9
             } else {
                 AspectRatio.RATIO_4_3
@@ -433,7 +509,7 @@ class CameraFragment : Fragment() {
 
                         applyCaptureRequestSettings(this)
                     }
-                    session.setRepeatingRequest(captureRequest.build(), null, cameraHandler)
+                    session.setRepeatingRequest(captureRequest.build(), previewMeterCallback(), cameraHandler)
                 } else {
                     initializeCamera()
                 }
@@ -443,25 +519,67 @@ class CameraFragment : Fragment() {
             }
         }
 
-        fragmentCameraBinding.cameraToggle?.isHapticFeedbackEnabled = false
+        // NOTE: isHapticFeedbackEnabled deliberately stays at its default
+        // (true) — it used to be force-disabled here, which silently turned
+        // every performHapticFeedback() on these buttons into a no-op.
         fragmentCameraBinding.cameraToggle?.isSoundEffectsEnabled = false
         fragmentCameraBinding.cameraToggle?.setOnClickListener {
-            if (isRecordingVideo || isProcessing) return@setOnClickListener
-            if (isVideoMode) {
-                it.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
-                toggleCameraVideoMode(false)
-            }
+            settleModeThumb(toVideo = false, haptic = it)
         }
 
-        fragmentCameraBinding.videoToggle?.isHapticFeedbackEnabled = false
         fragmentCameraBinding.videoToggle?.isSoundEffectsEnabled = false
         fragmentCameraBinding.videoToggle?.setOnClickListener {
-            if (isRecordingVideo || isProcessing) return@setOnClickListener
-            if (!isVideoMode) {
-                it.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
-                toggleCameraVideoMode(true)
+            settleModeThumb(toVideo = true, haptic = it)
+        }
+
+        // Drag support for the mode switch: the thumb follows the finger
+        // across the pill; release picks whichever half it's closest to.
+        // Taps fall through to the click listeners above. Disabled views
+        // never receive the touch listener, so recording/processing states
+        // block dragging exactly like they block tapping.
+        val touchSlop = android.view.ViewConfiguration.get(requireContext()).scaledTouchSlop
+        val modeDragListener = object : View.OnTouchListener {
+            private var downRawX = 0f
+            private var startTx = 0f
+            private var dragging = false
+
+            @SuppressLint("ClickableViewAccessibility")
+            override fun onTouch(v: View, event: android.view.MotionEvent): Boolean {
+                val thumb = _fragmentCameraBinding?.modeThumb ?: return false
+                val maxTx = 56.dpToPx().toFloat()
+                when (event.actionMasked) {
+                    android.view.MotionEvent.ACTION_DOWN -> {
+                        downRawX = event.rawX
+                        startTx = thumb.translationX
+                        dragging = false
+                    }
+                    android.view.MotionEvent.ACTION_MOVE -> {
+                        val dx = event.rawX - downRawX
+                        if (!dragging && kotlin.math.abs(dx) > touchSlop) dragging = true
+                        if (dragging) {
+                            thumb.animate().cancel()
+                            thumb.translationX = (startTx + dx).coerceIn(0f, maxTx)
+                        }
+                    }
+                    android.view.MotionEvent.ACTION_UP -> {
+                        if (dragging) {
+                            settleModeThumb(
+                                toVideo = thumb.translationX >= maxTx / 2f,
+                                haptic = v,
+                            )
+                        } else {
+                            v.performClick()
+                        }
+                    }
+                    android.view.MotionEvent.ACTION_CANCEL -> {
+                        if (dragging) animateModeThumb(isVideoMode)
+                    }
+                }
+                return true
             }
         }
+        fragmentCameraBinding.cameraToggle?.setOnTouchListener(modeDragListener)
+        fragmentCameraBinding.videoToggle?.setOnTouchListener(modeDragListener)
 
         fragmentCameraBinding.settingsToggle?.setOnClickListener {
             toggleSettingsMode()
@@ -487,20 +605,25 @@ class CameraFragment : Fragment() {
             videoPreset = when (videoPreset) {
                 VideoPreset.NORMAL -> VideoPreset.SUPER8
                 VideoPreset.SUPER8 -> VideoPreset.VHS
-                VideoPreset.VHS -> VideoPreset.CINEMATIC
-                VideoPreset.CINEMATIC -> VideoPreset.NORMAL
+                VideoPreset.VHS -> VideoPreset.NARRATION
+                VideoPreset.NARRATION -> VideoPreset.NORMAL
             }
-            // Any preset change drops a previous scene analysis — the grade
-            // was derived for the framing and pipeline at analysis time.
-            invalidateSceneAnalysis()
             // The look presets force their cadence + a capped, encoder-safe
             // resolution; leaving them restores a sensible frame-rate default.
             when (videoPreset) {
                 VideoPreset.SUPER8 -> coerceSuper8VideoSettings()
                 VideoPreset.VHS -> coerceVhsVideoSettings()
-                VideoPreset.CINEMATIC -> coerceCinematicVideoSettings()
-                VideoPreset.NORMAL -> if (videoFrameRate == 18 || videoFrameRate == 24 || videoFrameRate == 25) {
-                    videoFrameRate = if (30 in getSupportedVideoFramerates()) 30 else getSupportedVideoFramerates().firstOrNull() ?: 30
+                VideoPreset.NARRATION -> coerceNarrationVideoSettings()
+                VideoPreset.NORMAL -> {
+                    if (videoFrameRate == 18 || videoFrameRate == 24 || videoFrameRate == 25) {
+                        videoFrameRate = if (30 in getSupportedVideoFramerates()) 30 else getSupportedVideoFramerates().firstOrNull() ?: 30
+                    }
+                    // The look presets coerce the aspect (4:3 analogue, 16:9
+                    // cinema) — returning to NORMAL restores the user's own
+                    // video aspect. Without this, leaving CINEMATIC left the
+                    // normal pipeline stuck on 16:9.
+                    aspectRatio = videoAspectRatio
+                    updateViewfinderRatio()
                 }
             }
             updateSettingsUI()
@@ -531,11 +654,20 @@ class CameraFragment : Fragment() {
         }
 
         fragmentCameraBinding.galleryButton?.setOnClickListener {
-            openRecentPhoto()
+            if (isRecordingVideo && isNarration()) {
+                // During a Narration session this button is Cut/Continue.
+                it.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
+                if (isNarrationPaused) narrationContinue() else narrationCut()
+            } else {
+                openRecentPhoto()
+            }
         }
 
         fragmentCameraBinding.analyzeSceneButton?.setOnClickListener {
-            analyzeScene()
+            openSceneMenu()
+        }
+        fragmentCameraBinding.sceneSelectDim?.setOnClickListener {
+            closeSceneMenu()
         }
 
         // Capture button — registered ONCE. It does double duty:
@@ -550,7 +682,9 @@ class CameraFragment : Fragment() {
                 hideProgress()
             } else if (isVideoMode) {
                 if (isRecordingVideo) {
-                    stopRecordingVideo()
+                    // Narration sessions end with Save (assemble the cut
+                    // segments); the other looks keep their plain Stop.
+                    if (isNarration()) narrationSave() else stopRecordingVideo()
                 } else {
                     startRecordingVideo()
                 }
@@ -586,8 +720,180 @@ class CameraFragment : Fragment() {
         relativeOrientation = OrientationLiveData(requireContext()).apply {
             observe(viewLifecycleOwner, Observer { deviceCw ->
                 Log.d(TAG, "Device rotation changed: ${deviceCw}° CW")
+                // The layout itself never rotates: counter-rotate the
+                // button contents so they stay upright, and re-seat the
+                // Narration letterbox preview onto the edges that will be
+                // the bars in the recorded file.
+                lastDeviceCw = deviceCw
+                rotateUiForOrientation(deviceCw)
+                updateLetterboxOverlay()
             })
         }
+
+        // The letterbox preview depends on the container's pixel size —
+        // re-apply whenever the preview geometry changes (aspect switches).
+        fragmentCameraBinding.viewFinderContainer.addOnLayoutChangeListener {
+                _, l, t, r, b, oldL, oldT, oldR, oldB ->
+            if (r - l != oldR - oldL || b - t != oldB - oldT) {
+                updateLetterboxOverlay()
+            }
+        }
+
+        // Salvage any segments a crashed/killed Narration session left behind.
+        recoverNarrationSegments()
+    }
+
+    /**
+     * Counter-rotates the controls so their content reads upright in every
+     * device orientation. Square controls (mode pill, flash, settings,
+     * gallery/Cut, lens buttons) rotate in place; the capture button
+     * rotates scaled-to-fit (unscaled, a 5:1 pill turned 90° would burst
+     * its bounds); the Select-Scene chip slides at FULL size to the middle
+     * of whichever preview edge is "up" as held. The lens selector stays
+     * glued to the preview's bottom edge; only its buttons turn.
+     */
+    private fun rotateUiForOrientation(deviceCw: Int) {
+        val binding = _fragmentCameraBinding ?: return
+        val target = when (deviceCw) {
+            90 -> -90f
+            180 -> 180f
+            270 -> 90f
+            else -> 0f
+        }
+        val squareViews = mutableListOf<View>()
+        binding.cameraToggle?.let { squareViews.add(it) }
+        binding.videoToggle?.let { squareViews.add(it) }
+        binding.flashToggle?.let { squareViews.add(it) }
+        binding.settingsToggle?.let { squareViews.add(it) }
+        binding.galleryButton?.let { squareViews.add(it) }
+        val lensContainer = binding.lensSelectorContainer
+        for (i in 0 until (lensContainer?.childCount ?: 0)) {
+            lensContainer?.getChildAt(i)?.let { squareViews.add(it) }
+        }
+        for (view in squareViews) {
+            animateRotation(view, target, 1f)
+        }
+
+        val sideways = target == 90f || target == -90f
+
+        // The capture button rotates in place, uniformly scaled so the
+        // sideways pill fits inside its original footprint. Post: text
+        // changes (Record↔Save) relayout the button, and the fitting
+        // scale needs the settled width.
+        val capture: View = binding.captureButton
+        capture.post {
+            val scale = if (sideways && capture.width > 0 && capture.height > 0) {
+                (capture.height.toFloat() / capture.width.toFloat()).coerceIn(0.45f, 1f)
+            } else 1f
+            animateRotation(capture, target, scale)
+        }
+
+        // The Select-Scene chip keeps its full size and instead TRAVELS to
+        // the middle of whichever preview edge is "up" in the user's hand:
+        // top edge while upright, left/right edge in landscape (where it
+        // rides the vertical letterbox bar, mirroring its top-bar home).
+        binding.analyzeSceneButton?.let { chip ->
+            chip.post {
+                val container = binding.viewFinderContainer
+                val w = container.width.toFloat()
+                val h = container.height.toFloat()
+                if (w <= 0f || h <= 0f || chip.width == 0) return@post
+                val margin = 16.dpToPx().toFloat()
+                val homeCx = w / 2f
+                val homeCy = margin + chip.height / 2f
+                var tx = 0f
+                var ty = 0f
+                when (deviceCw) {
+                    // Device turned clockwise → the container's LEFT edge
+                    // is the top as held.
+                    90 -> {
+                        tx = (margin + chip.height / 2f) - homeCx
+                        ty = h / 2f - homeCy
+                    }
+                    // Counter-clockwise → the RIGHT edge is the top.
+                    270 -> {
+                        tx = (w - margin - chip.height / 2f) - homeCx
+                        ty = h / 2f - homeCy
+                    }
+                    else -> {
+                        // Upright & upside down: stay at the top centre.
+                    }
+                }
+                val current = chip.rotation
+                var delta = (target - current) % 360f
+                if (delta > 180f) delta -= 360f
+                if (delta <= -180f) delta += 360f
+                chip.animate()
+                    .rotation(current + delta)
+                    .translationX(tx)
+                    .translationY(ty)
+                    .scaleX(1f)
+                    .scaleY(1f)
+                    .setDuration(250L)
+                    .start()
+            }
+        }
+    }
+
+    private fun animateRotation(view: View, target: Float, scale: Float) {
+        // Shortest rotation path so 270° → 0° turns -90°, not +270°.
+        val current = view.rotation
+        var delta = (target - current) % 360f
+        if (delta > 180f) delta -= 360f
+        if (delta <= -180f) delta += 360f
+        view.animate()
+            .rotation(current + delta)
+            .scaleX(scale)
+            .scaleY(scale)
+            .setDuration(250L)
+            .start()
+    }
+
+    /**
+     * Positions the two preview letterbox bars where the baked 2.35:1 bars
+     * will sit in the SAVED film. The bars are horizontal in the encoded
+     * video, so in the portrait-locked preview they sit top/bottom while
+     * the phone is upright and left/right while it's held landscape.
+     */
+    private fun updateLetterboxOverlay() {
+        val binding = _fragmentCameraBinding ?: return
+        val barA = binding.letterboxBarA ?: return
+        val barB = binding.letterboxBarB ?: return
+        if (!isNarration()) {
+            barA.visibility = View.GONE
+            barB.visibility = View.GONE
+            return
+        }
+        val container = binding.viewFinderContainer
+        val w = container.width
+        val h = container.height
+        if (w <= 0 || h <= 0) {
+            container.post { updateLetterboxOverlay() }
+            return
+        }
+        val deviceCw = relativeOrientation.value ?: 0
+        val horizontalBars = deviceCw == 0 || deviceCw == 180
+        // Same fraction as the shader (bars start at vy ≈ 0.122).
+        val frac = 0.122f
+        if (horizontalBars) {
+            val barPx = (h * frac).toInt()
+            barA.layoutParams = android.widget.FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, barPx, android.view.Gravity.TOP,
+            )
+            barB.layoutParams = android.widget.FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, barPx, android.view.Gravity.BOTTOM,
+            )
+        } else {
+            val barPx = (w * frac).toInt()
+            barA.layoutParams = android.widget.FrameLayout.LayoutParams(
+                barPx, ViewGroup.LayoutParams.MATCH_PARENT, android.view.Gravity.START,
+            )
+            barB.layoutParams = android.widget.FrameLayout.LayoutParams(
+                barPx, ViewGroup.LayoutParams.MATCH_PARENT, android.view.Gravity.END,
+            )
+        }
+        barA.visibility = View.VISIBLE
+        barB.visibility = View.VISIBLE
     }
 
     private fun updateModeToggleUI() {
@@ -997,7 +1303,7 @@ class CameraFragment : Fragment() {
             VideoPreset.NORMAL -> getString(R.string.preset_normal)
             VideoPreset.SUPER8 -> getString(R.string.preset_super8)
             VideoPreset.VHS -> getString(R.string.preset_vhs)
-            VideoPreset.CINEMATIC -> getString(R.string.preset_cinematic)
+            VideoPreset.NARRATION -> getString(R.string.preset_narration)
         }
         binding.presetToggle?.text = "Film Mode $presetText"
 
@@ -1035,31 +1341,34 @@ class CameraFragment : Fragment() {
         updateModeToggleUI()
         updateFilterUI()
         updateAnalyzeSceneUI()
+        updateNarrationControls()
+        updateLetterboxOverlay()
     }
 
     /**
-     * The "Analyze Scene" chip at the top centre of the preview. Visible only
-     * in the CINEMATIC preset; highlighted (primary colour) while analysis is
-     * still pending — it is THE call to action there — and quiet once a grade
-     * is locked in, when it shows the detected mood instead.
+     * The "Select Scene" chip at the top centre of the preview. Visible only
+     * in the CINEMATIC preset; opens the 3x3 mood menu. Highlighted while
+     * the user hasn't picked yet (Blockbuster default applies silently);
+     * once a mood was chosen the chip recedes and names it.
      */
     private fun updateAnalyzeSceneUI() {
         val binding = _fragmentCameraBinding ?: return
         val button = binding.analyzeSceneButton ?: return
-        if (!isCinematic() || isShowingDone) {
+        if (!isNarration() || isShowingDone) {
             button.visibility = View.GONE
+            closeSceneMenu()
             return
         }
         button.visibility = View.VISIBLE
-        val clickable = !isRecordingVideo && !isProcessing && !isAnalyzingScene
+        val clickable = !isRecordingVideo && !isProcessing
         button.isEnabled = clickable
-        val grade = cinematicGrade
-        button.text = when {
-            isAnalyzingScene -> getString(R.string.analyze_scene_running)
-            grade != null -> getString(R.string.analyze_scene_done, grade.moodName)
-            else -> getString(R.string.analyze_scene)
+        button.text = if (cinematicMoodChosen) {
+            getString(R.string.analyze_scene_done, cinematicMood.displayName)
+        } else {
+            getString(R.string.select_scene)
         }
-        setButtonActiveStyle(button, clickable && grade == null)
+        setButtonActiveStyle(button, clickable && !cinematicMoodChosen)
+        if (lastDeviceCw != 0) rotateUiForOrientation(lastDeviceCw)
     }
 
     private fun updateFilterUI() {
@@ -1069,43 +1378,69 @@ class CameraFragment : Fragment() {
 
     private fun updateMovieToggleUI() {
         val binding = _fragmentCameraBinding ?: return
-        val movieToggleEnabled = !isRecordingVideo && !isProcessing && !isShowingDone
-        
+        // Deliberately NOT disabled while the review overlay is up: the
+        // photo/video toggle doubles as a "leave review and switch mode"
+        // shortcut there (see settleModeThumb).
+        val movieToggleEnabled = !isRecordingVideo && !isProcessing
+
         binding.cameraToggle?.isEnabled = movieToggleEnabled
         binding.videoToggle?.isEnabled = movieToggleEnabled
-        
+
         val activeColor = getOnPrimaryColor()
         val inactiveColor = getOnSecondaryContainerColor()
-        
-        if (!isVideoMode) {
-            // Camera is selected
-            binding.cameraToggle?.backgroundTintList = ColorStateList.valueOf(getPrimaryColor())
-            binding.cameraToggle?.iconTint = ColorStateList.valueOf(activeColor)
-            
-            // Video is unselected
-            binding.videoToggle?.backgroundTintList = ColorStateList.valueOf(Color.TRANSPARENT)
-            binding.videoToggle?.iconTint = ColorStateList.valueOf(inactiveColor)
+
+        // The sliding thumb carries the selection; the buttons themselves
+        // stay transparent and only switch their icon tint.
+        animateModeThumb(isVideoMode)
+        binding.cameraToggle?.backgroundTintList = ColorStateList.valueOf(Color.TRANSPARENT)
+        binding.videoToggle?.backgroundTintList = ColorStateList.valueOf(Color.TRANSPARENT)
+        binding.cameraToggle?.iconTint =
+            ColorStateList.valueOf(if (!isVideoMode) activeColor else inactiveColor)
+        if (isRecordingVideo) {
+            // movieBlinkAnimator owns the thumb colour + video icon tint.
         } else {
-            // Video is selected
-            if (isRecordingVideo) {
-                // If recording, movieBlinkAnimator handles its background/icon tint
-            } else {
-                binding.videoToggle?.backgroundTintList = ColorStateList.valueOf(getPrimaryColor())
-                binding.videoToggle?.iconTint = ColorStateList.valueOf(activeColor)
-            }
-            
-            // Camera is unselected
-            binding.cameraToggle?.backgroundTintList = ColorStateList.valueOf(Color.TRANSPARENT)
-            binding.cameraToggle?.iconTint = ColorStateList.valueOf(inactiveColor)
+            binding.videoToggle?.iconTint =
+                ColorStateList.valueOf(if (isVideoMode) activeColor else inactiveColor)
+            binding.modeThumb?.backgroundTintList = ColorStateList.valueOf(getPrimaryColor())
         }
+    }
+
+    /** Slides the mode thumb under the active half — instantly on the very
+     *  first placement, springily afterwards. */
+    private fun animateModeThumb(toVideo: Boolean) {
+        val thumb = _fragmentCameraBinding?.modeThumb ?: return
+        val target = if (toVideo) 56.dpToPx().toFloat() else 0f
+        if (!modeThumbPlaced) {
+            thumb.translationX = target
+            modeThumbPlaced = true
+            return
+        }
+        thumb.animate()
+            .translationX(target)
+            .setDuration(220L)
+            .setInterpolator(android.view.animation.OvershootInterpolator(1.2f))
+            .start()
+    }
+
+    /**
+     * Lands the thumb on [toVideo]'s half and switches the mode if it
+     * actually changed — with haptic feedback on [haptic], shared by taps
+     * and drag releases. From the review screen this doubles as "leave
+     * review and switch in one step" (no resume of the old preview;
+     * toggleCameraVideoMode re-initializes for the new mode anyway).
+     */
+    private fun settleModeThumb(toVideo: Boolean, haptic: View) {
+        animateModeThumb(toVideo)
+        if (isRecordingVideo || isProcessing) return
+        if (toVideo == isVideoMode) return
+        haptic.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
+        if (isShowingDone) hideProgress(resumePreviewAfter = false)
+        toggleCameraVideoMode(toVideo)
     }
 
     private fun toggleCameraVideoMode(toVideoMode: Boolean) {
         if (isRecordingVideo) return
         isVideoMode = toVideoMode
-        // Switching photo ↔ video changes pipeline and framing — a cinematic
-        // grade from before the switch no longer matches the scene.
-        invalidateSceneAnalysis()
         if (isVideoMode) {
             savedPhotoFilmSimulation = filmSimulation
             filmSimulation = FilmSimulation.NORMAL
@@ -1113,7 +1448,7 @@ class CameraFragment : Fragment() {
             when (videoPreset) {
                 VideoPreset.SUPER8 -> coerceSuper8VideoSettings()
                 VideoPreset.VHS -> coerceVhsVideoSettings()
-                VideoPreset.CINEMATIC -> coerceCinematicVideoSettings()
+                VideoPreset.NARRATION -> coerceNarrationVideoSettings()
                 VideoPreset.NORMAL -> {}
             }
         } else {
@@ -1186,16 +1521,11 @@ class CameraFragment : Fragment() {
     /** True when the VHS GL pipeline should be active. */
     private fun isVhs(): Boolean = isVideoMode && videoPreset == VideoPreset.VHS
 
-    /** True when the CINEMATIC GL pipeline should be active. */
-    private fun isCinematic(): Boolean = isVideoMode && videoPreset == VideoPreset.CINEMATIC
+    /** True when the NARRATION GL pipeline should be active. */
+    private fun isNarration(): Boolean = isVideoMode && videoPreset == VideoPreset.NARRATION
 
     /** True when any GL look (camera → renderer → encoder) is active. */
-    private fun usesGlPipeline(): Boolean = isSuper8() || isVhs() || isCinematic()
-
-    /** True while the CINEMATIC preset has no scene grade yet — Record is
-     *  greyed out until [analyzeScene] has produced one. */
-    private fun cinematicRecordLocked(): Boolean =
-        isCinematic() && cinematicGrade == null && !isRecordingVideo && !isShowingDone
+    private fun usesGlPipeline(): Boolean = isSuper8() || isVhs() || isNarration()
 
     /**
      * Super-8 is defined by 18 fps and is inherently low-resolution. We also
@@ -1226,80 +1556,513 @@ class CameraFragment : Fragment() {
     }
 
     /**
-     * Cinema is defined by 24 fps and a widescreen frame. 1080p is the sweet
-     * spot: encoder-safe on every device (unlike the sensor's MAX size, see
-     * [coerceSuper8VideoSettings]) while keeping the grade's softness and
-     * grain looking like glass+film rather than upscaled video.
+     * Narration is defined by 24 fps and a widescreen frame. The actual
+     * recording size is picked by [chooseNarrationVideoSize] (4K when the
+     * device officially supports it, 1080p otherwise) — videoResolution is
+     * parked at MAX so no UI-level clamp interferes.
      */
-    private fun coerceCinematicVideoSettings() {
+    private fun coerceNarrationVideoSettings() {
         videoFrameRate = 24
         aspectRatio = AspectRatio.RATIO_16_9
-        videoResolution = VideoResolution.FHD_1080P
+        videoResolution = VideoResolution.MAX
     }
 
     /**
-     * Drops the current scene analysis. Called whenever lens, preset or
-     * photo/video mode changes — the grade was computed for a specific
-     * framing and look, and Record re-locks until the user analyzes again.
+     * The Narration recording size: 3840×2160 when the device declares an
+     * official 2160p camcorder profile (the reliable "this encoder really
+     * records 4K" signal — probing stream sizes alone is what made the
+     * sensor-MAX size fail to even start encoding), otherwise 1080p. Only
+     * 16:9 sizes are considered; [setupMediaRecorder]'s fallback ladder
+     * still catches the exotic stragglers.
      */
-    private fun invalidateSceneAnalysis() {
-        cinematicGrade = null
-        updateAnalyzeSceneUI()
+    private fun chooseNarrationVideoSize(choices: Array<android.util.Size>): android.util.Size {
+        val sixteenNine = choices.filter {
+            kotlin.math.abs(it.width.toFloat() / it.height - 16f / 9f) < 0.05f
+        }
+        val supports4k = try {
+            val camId = (physicalToLogicalMap[currentCameraId] ?: currentCameraId).toIntOrNull()
+            camId != null && android.media.CamcorderProfile.hasProfile(
+                camId, android.media.CamcorderProfile.QUALITY_2160P,
+            )
+        } catch (exc: Exception) {
+            false
+        }
+        val targetHeight = if (supports4k) 2160 else 1080
+        return sixteenNine.filter { it.height <= targetHeight }
+            .maxByOrNull { it.width * it.height }
+            ?: sixteenNine.minByOrNull { it.width * it.height }
+            ?: android.util.Size(1920, 1080)
+    }
+
+    // -------- Narration Cut / Continue / Save --------
+
+    private fun nextNarrationSegmentFile(): File {
+        val dir = narrationSessionDir ?: File(
+            File(requireContext().getExternalFilesDir(null), "narration"),
+            "session_${System.currentTimeMillis()}",
+        ).apply { mkdirs() }.also { narrationSessionDir = it }
+        val file = File(dir, String.format(Locale.US, "seg_%03d.mp4", narrationSegmentIndex++))
+        narrationSegments.add(file)
+        return file
+    }
+
+    /**
+     * Finalizes the currently-rolling segment: detaches the GL encoder
+     * (blocking, so no swapBuffers can race the teardown) and stops the
+     * recorder, leaving a complete playable MP4 on disk. A segment too
+     * short to contain a frame is discarded.
+     */
+    private fun finalizeNarrationSegment() {
+        analogRenderer?.stopEncoder()
+        try {
+            mediaRecorder?.stop()
+        } catch (exc: RuntimeException) {
+            Log.w(TAG, "Narration segment too short, discarding: ${exc.message}")
+            narrationSegments.lastOrNull()?.delete()
+        }
+        try {
+            mediaRecorder?.reset()
+            mediaRecorder?.release()
+        } catch (exc: Throwable) {
+            Log.w(TAG, "Narration recorder release failed: ${exc.message}")
+        }
+        mediaRecorder = null
+    }
+
+    /** "Cut": pause the session. The segment so far is already safe on disk. */
+    private fun narrationCut() {
+        if (!isRecordingVideo || !isNarration() || isNarrationPaused) return
+        finalizeNarrationSegment()
+        isNarrationPaused = true
+        // Freeze the recording pulse while paused.
+        movieBlinkAnimator?.pause()
+        updateNarrationControls()
         updateCaptureButtonForState()
     }
 
-    /**
-     * "Analyze Scene": grabs one frame from the live viewfinder (PixelCopy —
-     * the preview is the ungraded camera image, exactly what we want to
-     * measure), runs [SceneAnalyzer] off the main thread, pushes the
-     * resulting grade into the GL renderer and unlocks Record. The result is
-     * discarded if the user switched lens/preset/mode while it was running.
-     */
-    private fun analyzeScene() {
-        if (!isCinematic() || isRecordingVideo || isProcessing || isAnalyzingScene || isShowingDone) return
-        val presetAtStart = videoPreset
-        val cameraAtStart = currentCameraId
-        isAnalyzingScene = true
-        updateAnalyzeSceneUI()
-        _fragmentCameraBinding?.analyzeSceneButton
-            ?.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
+    /** "Continue": start the next segment with the exact same encoding. */
+    private fun narrationContinue() {
+        if (!isRecordingVideo || !isNarration() || !isNarrationPaused) return
+        val size = narrationVideoSize ?: return
+        try {
+            setupMediaRecorder(
+                size, narrationVideoRotation,
+                narrationSegmentFile = nextNarrationSegmentFile(),
+            )
+            mediaRecorder?.start()
+            persistentSurface?.let { analogRenderer?.startEncoder(it, narrationEncoderRotation) }
+            isNarrationPaused = false
+            movieBlinkAnimator?.resume()
+            updateNarrationControls()
+            updateCaptureButtonForState()
+        } catch (exc: Exception) {
+            Log.e(TAG, "Failed to continue narration recording", exc)
+            Toast.makeText(requireContext(), "Failed to continue: ${exc.message}", Toast.LENGTH_SHORT).show()
+            // The session stays paused; everything recorded so far is safe.
+            narrationSegments.lastOrNull()?.takeIf { it.length() == 0L }?.delete()
+            isNarrationPaused = true
+            updateNarrationControls()
+        }
+    }
 
+    /** "Save": finalize the rolling segment and assemble the film. */
+    private fun narrationSave() {
+        if (!isRecordingVideo || !isNarration()) return
         viewLifecycleOwner.lifecycleScope.launch {
-            var grade: CinematicGrade? = null
             try {
-                val frame = captureSurfaceBitmap(fragmentCameraBinding.viewFinder)
-                if (frame != null) {
-                    grade = withContext(Dispatchers.Default) {
-                        try {
-                            SceneAnalyzer.analyze(frame)
-                        } finally {
-                            frame.recycle()
+                _fragmentCameraBinding?.captureButton?.isEnabled = false
+                setProcessing(true)
+                _fragmentCameraBinding?.captureButton?.performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY)
+                // Instant opaque black, same as the regular stop flow.
+                showProgress(CaptureProgress.Saving(null))
+
+                if (!isNarrationPaused) finalizeNarrationSegment()
+                isRecordingVideo = false
+                isNarrationPaused = false
+                cinematicManualExposure = null
+                if (::session.isInitialized) {
+                    try {
+                        session.stopRepeating()
+                    } catch (exc: Exception) {
+                        Log.w(TAG, "stopRepeating after narration failed: ${exc.message}")
+                    }
+                }
+                updateCaptureButtonForState()
+
+                val segments = narrationSegments.filter { it.exists() && it.length() > 0L }
+                var thumbnail: Bitmap? = null
+                if (segments.isNotEmpty()) {
+                    val saved = withContext(Dispatchers.IO) { assembleNarrationFilm(segments) }
+                    if (saved != null) {
+                        currentVideoFile = saved.first
+                        videoUri = saved.second
+                        withContext(Dispatchers.IO) {
+                            suspendCancellableCoroutine<Unit> { cont ->
+                                val context = context ?: return@suspendCancellableCoroutine
+                                android.media.MediaScannerConnection.scanFile(
+                                    context,
+                                    arrayOf(saved.first.absolutePath),
+                                    arrayOf("video/mp4"),
+                                ) { _, _ -> if (cont.isActive) cont.resume(Unit) }
+                            }
+                        }
+                        thumbnail = try {
+                            android.media.ThumbnailUtils.createVideoThumbnail(
+                                saved.first, android.util.Size(960, 1280), null,
+                            )
+                        } catch (exc: Exception) {
+                            Log.e(TAG, "Narration thumbnail failed", exc)
+                            null
                         }
                     }
                 }
-            } catch (exc: Exception) {
-                Log.e(TAG, "Scene analysis failed", exc)
-            }
-            isAnalyzingScene = false
-            val binding = _fragmentCameraBinding ?: return@launch
-            // Stale result — the world the grade was computed for is gone.
-            if (videoPreset != presetAtStart || currentCameraId != cameraAtStart || !isVideoMode) {
-                updateAnalyzeSceneUI()
-                return@launch
-            }
-            if (grade != null) {
-                cinematicGrade = grade
-                analogRenderer?.setCinematicGrade(grade.toUniforms())
-                Log.d(TAG, "Cinematic grade ready: ${grade.moodName}")
-                if (!isProcessing && !isRecordingVideo && !isCameraInitializing) {
-                    binding.captureButton.isEnabled = true
+
+                // The film is in the gallery — the segments served their purpose.
+                narrationSessionDir?.deleteRecursively()
+                narrationSessionDir = null
+                narrationSegments.clear()
+
+                kotlinx.coroutines.delay(1000)
+                if (thumbnail != null) {
+                    showProgress(CaptureProgress.Done(thumbnail))
+                } else {
+                    hideProgress()
+                    if (segments.isEmpty()) {
+                        Toast.makeText(requireContext(), "Nothing recorded", Toast.LENGTH_SHORT).show()
+                    }
                 }
-            } else {
-                Toast.makeText(requireContext(), "Scene analysis failed — try again", Toast.LENGTH_SHORT).show()
+            } catch (exc: Exception) {
+                Log.e(TAG, "Failed to save narration film", exc)
+                hideProgress()
+            } finally {
+                setProcessing(false)
+                movieBlinkAnimator?.cancel()
+                movieBlinkAnimator = null
+                isRecordingVideo = false
+                updateNarrationControls()
+                updateCaptureButtonForState()
+                updateMovieToggleUI()
+                if (_fragmentCameraBinding != null) {
+                    reEnableUI()
+                }
+                updateSettingsUI()
+                _fragmentCameraBinding?.galleryButton?.isEnabled = true
             }
-            updateAnalyzeSceneUI()
-            updateCaptureButtonForState()
         }
+    }
+
+    /**
+     * Writes the finished film into MediaStore (DCIM/Camera): a straight
+     * byte copy for a single segment, [Mp4Stitcher] for a real cut.
+     * Returns (file, uri) or null on failure.
+     */
+    private fun assembleNarrationFilm(segments: List<File>): Pair<File, android.net.Uri?>? {
+        val filename = "VID_${SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())}.mp4"
+        return try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                val resolver = requireContext().contentResolver
+                val contentValues = ContentValues().apply {
+                    put(MediaStore.Video.Media.DISPLAY_NAME, filename)
+                    put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
+                    put(MediaStore.Video.Media.RELATIVE_PATH, "${Environment.DIRECTORY_DCIM}/Camera")
+                }
+                val uri = resolver.insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, contentValues)
+                    ?: throw IOException("Failed to create MediaStore entry")
+                var ok = false
+                resolver.openFileDescriptor(uri, "rw")?.use { pfd ->
+                    ok = if (segments.size == 1) {
+                        FileOutputStream(pfd.fileDescriptor).use { out ->
+                            FileInputStream(segments[0]).use { it.copyTo(out, 1 shl 16) }
+                        }
+                        true
+                    } else {
+                        Mp4Stitcher.stitch(segments, pfd.fileDescriptor)
+                    }
+                }
+                if (!ok) {
+                    resolver.delete(uri, null, null)
+                    return null
+                }
+                val dcim = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DCIM)
+                Pair(File(File(dcim, "Camera"), filename), uri)
+            } else {
+                val dcim = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DCIM)
+                val outFile = File(File(dcim, "Camera").apply { if (!exists()) mkdirs() }, filename)
+                val ok = if (segments.size == 1) {
+                    FileOutputStream(outFile).use { out ->
+                        FileInputStream(segments[0]).use { it.copyTo(out, 1 shl 16) }
+                    }
+                    true
+                } else {
+                    FileOutputStream(outFile).use { out -> Mp4Stitcher.stitch(segments, out.fd) }
+                }
+                if (!ok) {
+                    outFile.delete()
+                    return null
+                }
+                Pair(outFile, null)
+            }
+        } catch (exc: Exception) {
+            Log.e(TAG, "Narration assembly failed", exc)
+            null
+        }
+    }
+
+    /**
+     * Crash/teardown safety net: any leftover segment dirs from earlier
+     * sessions (app killed, crash, battery death mid-recording) are
+     * assembled into a film and saved to the gallery on the next launch —
+     * the finished segments were never lost, only unassembled.
+     */
+    private fun recoverNarrationSegments() {
+        val appContext = requireContext().applicationContext
+        viewLifecycleOwner.lifecycleScope.launch(Dispatchers.IO) {
+            try {
+                val root = File(appContext.getExternalFilesDir(null), "narration")
+                val dirs = root.listFiles { f -> f.isDirectory } ?: return@launch
+                var recovered = false
+                for (dir in dirs) {
+                    val segments = dir.listFiles { f -> f.name.endsWith(".mp4") && f.length() > 0L }
+                        ?.sortedBy { it.name } ?: emptyList()
+                    if (segments.isNotEmpty()) {
+                        val saved = assembleNarrationFilm(segments)
+                        if (saved != null) {
+                            android.media.MediaScannerConnection.scanFile(
+                                appContext, arrayOf(saved.first.absolutePath), arrayOf("video/mp4"), null,
+                            )
+                            recovered = true
+                        }
+                    }
+                    dir.deleteRecursively()
+                }
+                if (recovered) {
+                    withContext(Dispatchers.Main) {
+                        _fragmentCameraBinding ?: return@withContext
+                        Toast.makeText(appContext, getString(R.string.narration_recovered), Toast.LENGTH_LONG).show()
+                    }
+                }
+            } catch (exc: Exception) {
+                Log.w(TAG, "Narration recovery failed", exc)
+            }
+        }
+    }
+
+    /**
+     * The gallery button doubles as Cut/Continue while a Narration session
+     * is live; outside of that it goes back to being the gallery shortcut.
+     */
+    private fun updateNarrationControls() {
+        val binding = _fragmentCameraBinding ?: return
+        val button = binding.galleryButton ?: return
+        if (isNarration() && isRecordingVideo) {
+            button.icon = null
+            button.textSize = 16f
+            if (isNarrationPaused) {
+                // Green = "go": resume the film.
+                button.text = getString(R.string.narration_continue)
+                button.backgroundTintList = ColorStateList.valueOf("#4CAF50".toColorInt())
+            } else {
+                // Amber = scissors hovering: end this take.
+                button.text = getString(R.string.narration_cut)
+                button.backgroundTintList = ColorStateList.valueOf("#FFC107".toColorInt())
+            }
+            button.setTextColor(Color.BLACK)
+            button.isEnabled = true
+        } else {
+            button.text = ""
+            button.setIconResource(R.drawable.ic_photo)
+            button.backgroundTintList = ColorStateList.valueOf(getSecondaryContainerColor())
+            button.iconTint = ColorStateList.valueOf(getOnSecondaryContainerColor())
+        }
+    }
+
+    /**
+     * Locked filmic exposure for a CINEMATIC recording: a 180° shutter
+     * (1/48 s at 24 fps) with the ISO lowered by the same factor, so overall
+     * brightness matches what AE was metering right before Record. The long
+     * shutter buys the natural motion blur that makes 24 fps read as smooth
+     * cinema instead of stuttery video; the fixed pair also means no AE
+     * ramping mid-clip — real cinema locks exposure per shot.
+     *
+     * Scene handling: the shutter is HARD-CAPPED at 1/48 s — it never
+     * stretches further, even in the dark. Two reasons: (a) cinema keeps
+     * its shutter angle and raises gain instead (longer shutters read as
+     * smeary, soap-opera motion), and (b) on several HALs the sensor
+     * cadence becomes exposure-bound — a 1/33 s "24 fps" stream really
+     * ticks at ~23 fps, which can never map evenly onto a 60/120 Hz
+     * display. 1/48 s leaves the sensor room to hold a true 24.000. If
+     * even base ISO is too much at 1/48 s (bright daylight, no ND filter
+     * on a phone), the shutter shortens just enough to hold the metered
+     * brightness.
+     *
+     * Returns null — and the recording stays on plain auto-exposure —
+     * whenever anything required is missing: no MANUAL_SENSOR capability,
+     * no AE telemetry yet, or absent ranges. Stability on every device
+     * beats the 180° shutter.
+     */
+    private fun computeCinematicExposure(): Pair<Long, Int>? {
+        try {
+            val caps = characteristics.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES)
+            if (caps == null ||
+                CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES_MANUAL_SENSOR !in caps
+            ) {
+                return null
+            }
+            val expRange = characteristics.get(CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE)
+                ?: return null
+            val isoRange = characteristics.get(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE)
+                ?: return null
+            val aeExp = lastAeExposureNs
+            val aeIso = lastAeIso
+            if (aeExp <= 0L || aeIso <= 0) return null
+
+            // The exposure product AE considered correct for the scene.
+            val product = aeExp.toDouble() * aeIso.toDouble()
+
+            // Fixed 180° shutter, clamped only by the sensor's own range.
+            val maxExp = minOf(expRange.upper, CINEMATIC_SHUTTER_NS)
+            var exp = CINEMATIC_SHUTTER_NS.coerceIn(expRange.lower, maxExp)
+
+            var iso = (product / exp).toInt()
+            if (iso < isoRange.lower) {
+                // Brighter than base ISO can take at this shutter — shorten
+                // the shutter instead of overexposing.
+                iso = isoRange.lower
+                exp = (product / iso).toLong().coerceIn(expRange.lower, maxExp)
+            } else if (iso > isoRange.upper) {
+                // Darker than the gain can cover at 1/48 s. Cinema answer:
+                // accept the denser image (the grade's exposure trim from
+                // scene analysis lifts it back) rather than smear motion.
+                iso = isoRange.upper
+            }
+            return exp to iso
+        } catch (exc: Exception) {
+            Log.w(TAG, "computeCinematicExposure failed", exc)
+            return null
+        }
+    }
+
+    /** Opens the Select Scene menu (3x3 mood grid + Recommend). */
+    private fun openSceneMenu() {
+        if (!isNarration() || isRecordingVideo || isProcessing || isShowingDone) return
+        val binding = _fragmentCameraBinding ?: return
+        populateSceneGrid()
+        binding.sceneSelectDim?.visibility = View.VISIBLE
+        binding.sceneSelectPanel?.visibility = View.VISIBLE
+    }
+
+    private fun closeSceneMenu() {
+        val binding = _fragmentCameraBinding ?: return
+        binding.sceneSelectDim?.visibility = View.GONE
+        binding.sceneSelectPanel?.visibility = View.GONE
+    }
+
+    /**
+     * Builds the 3x3 mood grid (once) and refreshes the selection ring.
+     * Each tile shows the bundled parrot reference image rendered with the
+     * mood's baseline grade — the CPU twin of the recording shader — so
+     * the tiles show exactly the character each look will bake in.
+     */
+    private fun populateSceneGrid() {
+        val binding = _fragmentCameraBinding ?: return
+        val grid = binding.sceneGrid ?: return
+        if (grid.childCount == 0) {
+            val tileSize = 96.dpToPx()
+            CinematicMood.entries.forEach { mood ->
+                val image = ImageView(requireContext()).apply {
+                    layoutParams = LinearLayout.LayoutParams(tileSize, tileSize)
+                    scaleType = ImageView.ScaleType.CENTER_CROP
+                    setImageResource(R.drawable.scene_preview_base)
+                }
+                val label = TextView(requireContext()).apply {
+                    layoutParams = LinearLayout.LayoutParams(
+                        tileSize, ViewGroup.LayoutParams.WRAP_CONTENT,
+                    )
+                    text = mood.displayName
+                    setTextColor(Color.WHITE)
+                    textSize = 11f
+                    maxLines = 1
+                    gravity = android.view.Gravity.CENTER_HORIZONTAL
+                    setPadding(0, 4.dpToPx(), 0, 5.dpToPx())
+                }
+                val column = LinearLayout(requireContext()).apply {
+                    orientation = LinearLayout.VERTICAL
+                    addView(image)
+                    addView(label)
+                }
+                val card = com.google.android.material.card.MaterialCardView(requireContext()).apply {
+                    radius = 12.dpToPx().toFloat()
+                    cardElevation = 0f
+                    setCardBackgroundColor("#33FFFFFF".toColorInt())
+                    strokeWidth = 0
+                    tag = mood
+                    layoutParams = android.widget.GridLayout.LayoutParams().apply {
+                        width = tileSize
+                        height = ViewGroup.LayoutParams.WRAP_CONTENT
+                        setMargins(4.dpToPx(), 4.dpToPx(), 4.dpToPx(), 4.dpToPx())
+                    }
+                    addView(column)
+                    setOnClickListener {
+                        performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
+                        selectMood(mood)
+                        closeSceneMenu()
+                    }
+                }
+                grid.addView(card)
+            }
+            buildSceneTiles()
+        }
+        refreshSceneSelection()
+    }
+
+    /** Renders the graded preview tiles off the main thread (cached). */
+    private fun buildSceneTiles() {
+        if (sceneTileCache != null) {
+            applySceneTiles()
+            return
+        }
+        viewLifecycleOwner.lifecycleScope.launch {
+            val tiles = withContext(Dispatchers.Default) {
+                val base = BitmapFactory.decodeResource(resources, R.drawable.scene_preview_base)
+                val map = CinematicMood.entries.associateWith { mood ->
+                    SceneAnalyzer.baselineGrade(mood).renderPreview(base)
+                }
+                base.recycle()
+                map
+            }
+            sceneTileCache = tiles
+            applySceneTiles()
+        }
+    }
+
+    private fun applySceneTiles() {
+        val tiles = sceneTileCache ?: return
+        val grid = _fragmentCameraBinding?.sceneGrid ?: return
+        for (i in 0 until grid.childCount) {
+            val card = grid.getChildAt(i) as? com.google.android.material.card.MaterialCardView ?: continue
+            val mood = card.tag as? CinematicMood ?: continue
+            val image = (card.getChildAt(0) as? LinearLayout)?.getChildAt(0) as? ImageView ?: continue
+            tiles[mood]?.let { image.setImageBitmap(it) }
+        }
+    }
+
+    /** Highlights the active mood's tile with a primary-colour ring. */
+    private fun refreshSceneSelection() {
+        val grid = _fragmentCameraBinding?.sceneGrid ?: return
+        for (i in 0 until grid.childCount) {
+            val card = grid.getChildAt(i) as? com.google.android.material.card.MaterialCardView ?: continue
+            val selected = card.tag == cinematicMood
+            card.strokeColor = getPrimaryColor()
+            card.strokeWidth = if (selected) 3.dpToPx() else 0
+        }
+    }
+
+    private fun selectMood(mood: CinematicMood) {
+        cinematicMood = mood
+        cinematicMoodChosen = true
+        Log.d(TAG, "Cinematic mood selected: ${mood.displayName}")
+        refreshSceneSelection()
+        updateAnalyzeSceneUI()
     }
 
     /**
@@ -1356,12 +2119,28 @@ class CameraFragment : Fragment() {
             if (isSuper8()) {
                 applySuper8Exposure(builder)
             }
+            // While a CINEMATIC clip is rolling, exposure is locked to the
+            // filmic 180°-shutter pair computed at Record press: AE off,
+            // long shutter, low ISO, and an exact 24 fps sensor cadence.
+            // AF/AWB stay automatic (CONTROL_MODE remains AUTO) and the
+            // torch keeps working via FLASH_MODE set above.
+            val manual = cinematicManualExposure
+            if (manual != null && isNarration()) {
+                builder.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_OFF)
+                builder.set(CaptureRequest.SENSOR_EXPOSURE_TIME, manual.first)
+                builder.set(CaptureRequest.SENSOR_SENSITIVITY, manual.second)
+                val maxFrameDur = characteristics.get(CameraCharacteristics.SENSOR_INFO_MAX_FRAME_DURATION)
+                if (maxFrameDur == null || maxFrameDur >= CINEMATIC_FRAME_DURATION_NS) {
+                    builder.set(CaptureRequest.SENSOR_FRAME_DURATION, CINEMATIC_FRAME_DURATION_NS)
+                }
+            }
         } else {
             builder.set(CaptureRequest.CONTROL_AE_MODE, flashMode)
         }
     }
 
     private fun chooseVideoSize(choices: Array<android.util.Size>): android.util.Size {
+        if (isNarration()) return chooseNarrationVideoSize(choices)
         val targetRatio = when (aspectRatio) {
             AspectRatio.RATIO_1_1 -> 1.0f
             AspectRatio.RATIO_4_3 -> 4.0f / 3.0f
@@ -1402,7 +2181,12 @@ class CameraFragment : Fragment() {
         return sortedChoices.maxByOrNull { it.width * it.height } ?: choices.first()
     }
 
-    private fun setupMediaRecorder(videoSize: android.util.Size, rotation: Int, isTemp: Boolean = false) {
+    private fun setupMediaRecorder(
+        videoSize: android.util.Size,
+        rotation: Int,
+        isTemp: Boolean = false,
+        narrationSegmentFile: File? = null,
+    ) {
         try {
             mediaRecorder?.reset()
             mediaRecorder?.release()
@@ -1411,7 +2195,19 @@ class CameraFragment : Fragment() {
         }
         mediaRecorder = null
 
-        if (isTemp) {
+        if (narrationSegmentFile != null) {
+            // Narration segments are plain files in app-external storage —
+            // each one finalized at Cut/Save, so a crash can only ever lose
+            // the segment currently being written. The film lands in
+            // MediaStore at assembly time, not here.
+            mediaRecorder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                android.media.MediaRecorder(requireContext())
+            } else {
+                @Suppress("DEPRECATION")
+                android.media.MediaRecorder()
+            }
+            mediaRecorder?.setOutputFile(narrationSegmentFile.absolutePath)
+        } else if (isTemp) {
             mediaRecorder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
                 android.media.MediaRecorder(requireContext())
             } else {
@@ -1518,7 +2314,15 @@ class CameraFragment : Fragment() {
             setAudioEncoder(android.media.MediaRecorder.AudioEncoder.AAC)
             setVideoSize(encW, encH)
             setVideoFrameRate(fps)
-            val bitrate = when (res) {
+            // NARRATION scales its budget with the actual recording size:
+            // grain + bloom need headroom, but 12 Mbps (the user-approved
+            // 1080p figure) would starve a 4K frame — the H.264 rule of
+            // thumb is bitrate ∝ pixel count.
+            val bitrate = if (isNarration()) when {
+                videoSize.height >= 2160 || videoSize.width >= 3840 -> 40000000
+                videoSize.height >= 1440 -> 20000000
+                else -> 12000000
+            } else when (res) {
                 VideoResolution.MAX -> 20000000
                 VideoResolution.QHD_1440P -> 16000000
                 VideoResolution.FHD_1080P -> 10000000
@@ -1532,7 +2336,7 @@ class CameraFragment : Fragment() {
                 setAudioEncodingBitRate(32000)
                 setAudioChannels(1)
                 setAudioSamplingRate(16000)
-            } else if (isCinematic()) {
+            } else if (isNarration()) {
                 // Cinema audio: stereo 48 kHz AAC at a healthy bitrate — the
                 // CamcorderProfile default envelope, supported everywhere.
                 setAudioEncodingBitRate(192000)
@@ -1550,10 +2354,6 @@ class CameraFragment : Fragment() {
 
     private fun startRecordingVideo() {
         if (!::session.isInitialized) return
-        // CINEMATIC records only with a scene grade — the button is disabled
-        // in that state, this is a belt-and-braces guard for indirect paths
-        // (e.g. triggerCapture).
-        if (cinematicRecordLocked()) return
 
         viewLifecycleOwner.lifecycleScope.launch {
             try {
@@ -1574,8 +2374,57 @@ class CameraFragment : Fragment() {
                     else -> 0
                 }
                 val videoRotation = computeJpegOrientation(characteristics, deviceCw)
-                
-                setupMediaRecorder(videoSize, videoRotation)
+
+                if (isNarration()) {
+                    // Fresh segment session. The dir lives in app-external
+                    // storage so a crash leaves finished segments behind for
+                    // recovery on the next launch.
+                    narrationSessionDir = File(
+                        File(requireContext().getExternalFilesDir(null), "narration"),
+                        "session_${System.currentTimeMillis()}",
+                    ).apply { mkdirs() }
+                    narrationSegments.clear()
+                    narrationSegmentIndex = 0
+                    isNarrationPaused = false
+                    narrationVideoSize = videoSize
+                    narrationVideoRotation = videoRotation
+                    setupMediaRecorder(videoSize, videoRotation, narrationSegmentFile = nextNarrationSegmentFile())
+                } else {
+                    setupMediaRecorder(videoSize, videoRotation)
+                }
+
+                // Lock the filmic exposure for the whole clip (cinema style),
+                // metered off the live AE state at the moment Record was
+                // pressed. Null on unsupported devices → plain AE.
+                cinematicManualExposure = if (isNarration()) computeCinematicExposure() else null
+                cinematicManualExposure?.let { (expNs, iso) ->
+                    Log.d(
+                        TAG,
+                        "Cinematic exposure lock: 1/${(1_000_000_000.0 / expNs).toInt()} s @ ISO $iso " +
+                            "(AE was 1/${if (lastAeExposureNs > 0) (1_000_000_000.0 / lastAeExposureNs).toInt() else 0} s @ ISO $lastAeIso)",
+                    )
+                }
+
+                // Build the recording grade: the selected mood, adapted to
+                // the actual scene at the moment Record was pressed (frame
+                // unavailable → the mood's pure baseline).
+                if (isNarration()) {
+                    val frame = captureSurfaceBitmap(fragmentCameraBinding.viewFinder)
+                    val grade = withContext(Dispatchers.Default) {
+                        if (frame != null) {
+                            try {
+                                SceneAnalyzer.gradeFor(cinematicMood, frame)
+                            } finally {
+                                frame.recycle()
+                            }
+                        } else {
+                            SceneAnalyzer.baselineGrade(cinematicMood)
+                        }
+                    }
+                    cinematicGrade = grade
+                    analogRenderer?.setCinematicGrade(grade.toUniforms())
+                    Log.d(TAG, "Cinematic recording grade: ${grade.moodName}")
+                }
 
                 if (usesGlPipeline()) {
                     val renderInput = analogRenderer?.inputSurfaceOrNull()
@@ -1603,6 +2452,7 @@ class CameraFragment : Fragment() {
                     // configureAndPrepareMediaRecorder.
                     val sensorOrientation = characteristics.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 0
                     val encoderRotation = ((videoRotation - sensorOrientation) + 360) % 360
+                    narrationEncoderRotation = encoderRotation
                     persistentSurface?.let { analogRenderer?.startEncoder(it, encoderRotation) }
                 } else {
                     // Update the repeating request to target both the viewfinder and the persistent surface.
@@ -1669,19 +2519,24 @@ class CameraFragment : Fragment() {
                             Color.WHITE
                         ) as Int
                         
-                        _fragmentCameraBinding?.videoToggle?.let { button ->
-                            button.backgroundTintList = ColorStateList.valueOf(color)
-                            button.iconTint = ColorStateList.valueOf(iconColor)
-                        }
+                        // The recording pulse lives on the slider thumb now;
+                        // the video icon riding on it pulses in sync.
+                        _fragmentCameraBinding?.modeThumb?.backgroundTintList =
+                            ColorStateList.valueOf(color)
+                        _fragmentCameraBinding?.videoToggle?.iconTint =
+                            ColorStateList.valueOf(iconColor)
                     }
                     start()
                 }
                 
                 updateCaptureButtonForState()
                 fragmentCameraBinding.captureButton.isEnabled = true
-                
+
                 updateSettingsUI()
-                fragmentCameraBinding.galleryButton?.isEnabled = false
+                // In Narration the gallery button doubles as Cut/Continue;
+                // everywhere else it stays locked while recording.
+                fragmentCameraBinding.galleryButton?.isEnabled = isNarration()
+                updateNarrationControls()
             } catch (exc: Exception) {
                 Log.e(TAG, "Failed to start video recording", exc)
                 Toast.makeText(requireContext(), "Failed to start recording: ${exc.message}", Toast.LENGTH_SHORT).show()
@@ -1701,6 +2556,12 @@ class CameraFragment : Fragment() {
                 // Add haptic feedback for record stop
                 _fragmentCameraBinding?.captureButton?.performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY)
 
+                // Black out the preview the moment Stop is pressed — the
+                // encoder already has every frame it needs, and waiting for
+                // recorder teardown left the live preview visible for a
+                // beat before the overlay appeared.
+                showProgress(CaptureProgress.Saving(null))
+
                 // Stop the film-reel countdown (no-op outside SUPER8).
                 stopReelCountdown()
 
@@ -1713,17 +2574,19 @@ class CameraFragment : Fragment() {
                     }
                     mediaRecorder?.stop()
 
-                    // Revert the repeating request to preview-only — stops feeding
-                    // the record target (persistent surface or renderer input).
-                    if (::session.isInitialized && _fragmentCameraBinding != null) {
-                        val captureRequest = camera.createCaptureRequest(CameraDevice.TEMPLATE_RECORD).apply {
-                            addTarget(_fragmentCameraBinding!!.viewFinder.holder.surface)
-                            applyCaptureRequestSettings(this)
-                        }
-                        session.setRepeatingRequest(captureRequest.build(), null, cameraHandler)
-                    }
+                    // The filmic exposure lock only spans the recording.
+                    cinematicManualExposure = null
 
-                    _fragmentCameraBinding?.viewFinder?.post(shutterFlashTask)
+                    // Power down the camera for the developing/review phase
+                    // (the opaque overlay went up at Stop already).
+                    // resumePreview() ("Take new") restarts it.
+                    if (::session.isInitialized) {
+                        try {
+                            session.stopRepeating()
+                        } catch (exc: Exception) {
+                            Log.w(TAG, "stopRepeating after recording failed: ${exc.message}")
+                        }
+                    }
                 } catch (exc: RuntimeException) {
                     Log.e(TAG, "RuntimeException stopping MediaRecorder: dynamic check, might be too short", exc)
                     currentVideoFile?.delete()
@@ -1778,9 +2641,16 @@ class CameraFragment : Fragment() {
 
                 if (thumbnail != null) {
                     showProgress(CaptureProgress.Done(thumbnail))
+                } else {
+                    // No reviewable file (too-short clip, thumbnail failure):
+                    // drop the black overlay and restart the live preview —
+                    // otherwise the opaque Saving state would linger.
+                    hideProgress()
                 }
             } catch (exc: Exception) {
                 Log.e(TAG, "Failed to stop video recording", exc)
+                // Never leave the opaque Saving overlay stranded.
+                hideProgress()
             } finally {
                 setProcessing(false)
                 movieBlinkAnimator?.cancel()
@@ -1931,34 +2801,49 @@ class CameraFragment : Fragment() {
             val bottomInset = systemBars?.bottom ?: 0
             val wMax = maxOf(1, resources.displayMetrics.widthPixels - 32.dpToPx())
             val hMax = maxOf(1, resources.displayMetrics.heightPixels - 311.dpToPx() - bottomInset)
-            val availableRatio = wMax.toFloat() / hMax.toFloat()
-            val targetRatio = targetW.toFloat() / targetH.toFloat()
 
-            val ratio = if (targetRatio > availableRatio) {
-                "H,$targetW:$targetH"
-            } else {
-                "W,$targetW:$targetH"
+            // Explicit pixel sizing — no ConstraintLayout ratio strings, no
+            // constrained-dimension resolution. Every aspect's box derives
+            // from the same two inputs (available width, conservative slot
+            // height), so 4:3 and 16:9 share their height BY CONSTRUCTION
+            // and cannot drift apart through resolver quirks or borderline
+            // estimates — the source of all previous "ein bisschen" shifts.
+            val pair43W = if (needsSwap) 3 else 4
+            val pair43H = if (needsSwap) 4 else 3
+            val h43 = minOf(wMax * pair43H / pair43W, hMax)
+            val (boxW, boxH) = when (aspectRatio) {
+                // The square floats centred in the slot (design choice),
+                // sized by the tighter screen dimension.
+                AspectRatio.RATIO_1_1 -> {
+                    val side = minOf(wMax, hMax)
+                    Pair(side, side)
+                }
+                else -> {
+                    // 16:9 inherits the 4:3 height, so toggling between the
+                    // two never moves a single edge.
+                    var h = h43
+                    var w = h * targetW / targetH
+                    if (w > wMax) {
+                        w = wMax
+                        h = w * targetH / targetW
+                    }
+                    Pair(w, h)
+                }
             }
 
-            Log.d(TAG, "updateViewfinderRatio | container=$ratio (target=$targetW:$targetH, availableRatio=$availableRatio, targetRatio=$targetRatio)")
+            Log.d(TAG, "updateViewfinderRatio | box=${boxW}x$boxH (target=$targetW:$targetH, wMax=$wMax, hMax=$hMax)")
 
             val constraintSet = androidx.constraintlayout.widget.ConstraintSet()
             constraintSet.clone(fragmentCameraBinding.root as androidx.constraintlayout.widget.ConstraintLayout)
-            constraintSet.setDimensionRatio(R.id.view_finder_container, ratio)
-            constraintSet.constrainedWidth(R.id.view_finder_container, true)
-            constraintSet.constrainedHeight(R.id.view_finder_container, true)
-
-            if (aspectRatio == AspectRatio.RATIO_16_9) {
-                val ratio43Ratio = if (needsSwap) 3f / 4f else 4f / 3f
-                val height43 = if (ratio43Ratio > availableRatio) {
-                    (wMax / ratio43Ratio).toInt()
-                } else {
-                    hMax
-                }
-                constraintSet.constrainMaxHeight(R.id.view_finder_container, height43)
-            } else {
-                constraintSet.constrainMaxHeight(R.id.view_finder_container, Int.MAX_VALUE)
-            }
+            constraintSet.setDimensionRatio(R.id.view_finder_container, null)
+            constraintSet.constrainWidth(R.id.view_finder_container, boxW)
+            constraintSet.constrainHeight(R.id.view_finder_container, boxH)
+            // Full-height ratios stay pinned to the top of the slot (the
+            // chip never moves); 1:1 sits centred.
+            constraintSet.setVerticalBias(
+                R.id.view_finder_container,
+                if (aspectRatio == AspectRatio.RATIO_1_1) 0.5f else 0f,
+            )
 
             constraintSet.applyTo(fragmentCameraBinding.root as androidx.constraintlayout.widget.ConstraintLayout)
         } catch (e: Exception) {
@@ -2030,7 +2915,8 @@ class CameraFragment : Fragment() {
 
     /** Lifecycle stage of a capture, drives the overlay state machine. */
     private sealed class CaptureProgress {
-        /** HAL is exposing + the file is being saved. UI: just a dim. */
+        /** The file is being captured/saved. UI: opaque black over the
+         *  preview (the camera is stopped behind it). */
         data class Saving(val frozenBitmap: Bitmap?) : CaptureProgress()
         /** Save complete — show the saved image fitCenter at preview size. */
         data class Done(val thumbnail: Bitmap?) : CaptureProgress()
@@ -2071,9 +2957,11 @@ class CameraFragment : Fragment() {
                 }
                 oldFrozen?.takeIf { it !== state.frozenBitmap && !it.isRecycled }?.recycle()
 
+                // Instantly opaque — a fade-in here read as "first dimmed,
+                // then black" over the still-live preview.
+                overlay.animate().cancel()
                 overlay.visibility = View.VISIBLE
-                overlay.alpha = 0f
-                overlay.animate().alpha(1f).setDuration(180L).start()
+                overlay.alpha = 1f
                 isShowingDone = false
                 updateCaptureButtonForState()
             }
@@ -2134,7 +3022,7 @@ class CameraFragment : Fragment() {
         }
     }
 
-    private fun hideProgress() {
+    private fun hideProgress(resumePreviewAfter: Boolean = true) {
         val binding = _fragmentCameraBinding ?: return
         val overlay = binding.captureProgressOverlay ?: return
         val thumbnail = binding.captureProgressThumbnail ?: return
@@ -2174,8 +3062,9 @@ class CameraFragment : Fragment() {
         // Restore the live preview. The session is usually still fully
         // configured (it was only stopped for the review overlay), so a
         // repeating request is all that's needed — full re-initialization
-        // only happens as a fallback.
-        resumePreview()
+        // only happens as a fallback. Skipped when the caller immediately
+        // re-initializes anyway (mode switch from the review screen).
+        if (resumePreviewAfter) resumePreview()
     }
 
     /**
@@ -2191,7 +3080,7 @@ class CameraFragment : Fragment() {
                     addTarget(fragmentCameraBinding.viewFinder.holder.surface)
                     applyCaptureRequestSettings(this)
                 }
-                session.setRepeatingRequest(captureRequest.build(), null, cameraHandler)
+                session.setRepeatingRequest(captureRequest.build(), previewMeterCallback(), cameraHandler)
             } else {
                 initializeCamera()
             }
@@ -2283,21 +3172,16 @@ class CameraFragment : Fragment() {
             when {
                 isShowingDone -> R.string.progress_take_new
                 isProcessing -> R.string.progress_developing
+                // Narration sessions end with Save; Cut/Continue live on
+                // the gallery button (see updateNarrationControls).
+                isRecordingVideo && isNarration() -> R.string.narration_save
                 isRecordingVideo -> R.string.video_stop
                 isVideoMode -> R.string.video_record
                 else -> R.string.capture
             }
         )
 
-        // In CINEMATIC, Record stays locked (grey + disabled) until the scene
-        // has been analyzed — the whole point of the preset is recording with
-        // a scene-matched grade, never without one. Only ever DISABLE here;
-        // re-enabling is owned by the analysis/init flows.
-        if (cinematicRecordLocked()) {
-            button.isEnabled = false
-        }
-
-        if (isProcessing || cinematicRecordLocked()) {
+        if (isProcessing) {
             button.backgroundTintList = ColorStateList.valueOf(getSecondaryContainerColor())
             button.setTextColor(getOnSecondaryContainerColor())
             button.iconTint = ColorStateList.valueOf(getOnSecondaryContainerColor())
@@ -2306,6 +3190,10 @@ class CameraFragment : Fragment() {
             button.setTextColor(getOnPrimaryColor())
             button.iconTint = ColorStateList.valueOf(getOnPrimaryColor())
         }
+
+        // The label change may alter the button's width — refresh the
+        // sideways fitting transform.
+        if (lastDeviceCw != 0) rotateUiForOrientation(lastDeviceCw)
     }
 
     private fun releaseResources() {
@@ -2323,6 +3211,12 @@ class CameraFragment : Fragment() {
             }
             isRecordingVideo = false
         }
+        // A torn-down Narration session keeps its segment FILES — they're
+        // assembled into a film by recoverNarrationSegments() on the next
+        // launch. Only the in-memory session state is reset here.
+        isNarrationPaused = false
+        narrationSegments.clear()
+        narrationSessionDir = null
         try {
             mediaRecorder?.reset()
         } catch (exc: Throwable) {
@@ -2397,9 +3291,7 @@ class CameraFragment : Fragment() {
     private fun reEnableUI() {
         Log.d(TAG, "reEnableUI() called, setting isCameraInitializing to false")
         isCameraInitializing = false
-        // Capture comes back except while CINEMATIC still waits for its
-        // scene analysis (Record is gated on the grade there).
-        fragmentCameraBinding.captureButton.isEnabled = !cinematicRecordLocked()
+        fragmentCameraBinding.captureButton.isEnabled = true
         val count = fragmentCameraBinding.lensSelectorContainer?.childCount ?: 0
         for (i in 0 until count) {
             fragmentCameraBinding.lensSelectorContainer?.getChildAt(i)?.isEnabled = true
@@ -2429,10 +3321,6 @@ class CameraFragment : Fragment() {
         
         Log.d(TAG, "Switching camera to $newId")
         currentCameraId = newId
-
-        // A lens switch changes field of view and exposure behaviour — any
-        // cinematic scene grade no longer matches what the camera sees.
-        invalidateSceneAnalysis()
 
         // Update highlight immediately for responsive feel
         updateLensHighlight()
@@ -2507,7 +3395,11 @@ class CameraFragment : Fragment() {
      */
     private fun initializeCamera() {
         cameraJob?.cancel()
-        
+
+        // A (re)init always returns the preview to live auto-exposure — the
+        // filmic lock only ever spans one recording.
+        if (!isRecordingVideo) cinematicManualExposure = null
+
         _fragmentCameraBinding?.overlay?.animate()?.cancel()
         _fragmentCameraBinding?.overlay?.setBackgroundColor(Color.TRANSPARENT)
         _fragmentCameraBinding?.overlay?.alpha = 0f
@@ -2532,7 +3424,7 @@ class CameraFragment : Fragment() {
             when {
                 isSuper8() -> coerceSuper8VideoSettings()
                 isVhs() -> coerceVhsVideoSettings()
-                else -> coerceCinematicVideoSettings()
+                else -> coerceNarrationVideoSettings()
             }
             if (videoResolution to videoFrameRate != before) settingsChanged = true
         }
@@ -2663,8 +3555,16 @@ class CameraFragment : Fragment() {
                     // if GL init fails on this device, fall back to NORMAL so
                     // video still works.
                     if (usesGlPipeline()) {
-                        val capW = computedPreviewSize.width
-                        val capH = computedPreviewSize.height
+                        // SUPER8/VHS capture at the FOV-correct preview size
+                        // (small capture sizes crop the FOV on some HALs) and
+                        // GL downscales to 480p. NARRATION is the opposite:
+                        // it records at up to 4K, so the camera must feed the
+                        // renderer at the FULL recording size — large streams
+                        // have native FOV, and capturing at preview size
+                        // would upscale ~1080p into a fake-4K file.
+                        val capSize = if (isNarration()) videoSize else computedPreviewSize
+                        val capW = capSize.width
+                        val capH = capSize.height
                         val look = when {
                             isSuper8() -> AnalogLook.SUPER8
                             isVhs() -> AnalogLook.VHS
@@ -2682,8 +3582,20 @@ class CameraFragment : Fragment() {
                         if (analogRenderer == null) {
                             Log.e(TAG, "$look GL pipeline unavailable; falling back to NORMAL preset")
                             videoPreset = VideoPreset.NORMAL
+                            // Session-only fallback: deliberately NOT persisted, so
+                            // the next app start retries the GL pipeline — a
+                            // transient EGL hiccup must not silently demote the
+                            // preset forever (it did once: prefs ended up with
+                            // NORMAL at 24 fps and every "preset" recording was
+                            // secretly normal). Restore the NORMAL frame-rate
+                            // default too, and TELL the user.
+                            if (30 in getSupportedVideoFramerates()) videoFrameRate = 30
                             updateSettingsUI()
-                            saveSettings()
+                            Toast.makeText(
+                                requireContext(),
+                                "Film look unavailable right now — recording in Normal",
+                                Toast.LENGTH_LONG,
+                            ).show()
                         } else if (look == AnalogLook.CINEMATIC) {
                             // Re-apply an existing scene grade after the renderer
                             // was (re)created — e.g. on a session rebuild between
@@ -2807,7 +3719,7 @@ class CameraFragment : Fragment() {
 
                 // This will keep sending the capture request as frequently as possible until the
                 // session is torn down or session.stopRepeating() is called
-                session.setRepeatingRequest(captureRequest.build(), null, cameraHandler)
+                session.setRepeatingRequest(captureRequest.build(), previewMeterCallback(), cameraHandler)
 
                 initialized = true
                 Log.d(TAG, "Camera initialized successfully.")
@@ -2877,16 +3789,20 @@ class CameraFragment : Fragment() {
         setProcessing(true)
 
         viewLifecycleOwner.lifecycleScope.launch {
-            // Capture a snapshot of the viewfinder to freeze it on screen
-            val rawFrozen = captureSurfaceBitmap(fragmentCameraBinding.viewFinder)
-            val frozen = if (rawFrozen != null) {
-                cropToAspectRatio(rawFrozen).also {
-                    if (it !== rawFrozen) rawFrozen.recycle()
-                }
-            } else rawFrozen
-            showProgress(CaptureProgress.Saving(frozen))
+            // Opaque black over the preview for the whole developing phase —
+            // no frozen snapshot, no live feed.
+            showProgress(CaptureProgress.Saving(null))
             try {
                 val captured = withContext(Dispatchers.IO) { takePhoto() }
+                // The capture is in hand — stop the camera for the rest of
+                // the save + review. The overlay above is opaque black, so
+                // nothing live is visible anyway; resumePreview() restarts
+                // the repeating request on "Take new".
+                try {
+                    if (::session.isInitialized) session.stopRepeating()
+                } catch (exc: Exception) {
+                    Log.w(TAG, "stopRepeating after capture failed: ${exc.message}")
+                }
                 val saved: SaveOutput = captured.use { result ->
                     when {
                         // RAW capture + user wants JPEG or WebP → demosaic into a Bitmap
@@ -3509,6 +4425,7 @@ class CameraFragment : Fragment() {
     }
 
     override fun onDestroyView() {
+        sceneTileCache = null
         doneThumbnail?.takeIf { !it.isRecycled }?.recycle()
         doneThumbnail = null
         frozenThumbnail?.takeIf { !it.isRecycled }?.recycle()
@@ -3538,6 +4455,12 @@ class CameraFragment : Fragment() {
 
         /** SUPER8 "film reel" length — recordings auto-stop after this. */
         private const val SUPER8_MAX_MILLIS: Long = 200_000L
+
+        /** 180° shutter at 24 fps (1/48 s) — the cinema-standard motion blur. */
+        private const val CINEMATIC_SHUTTER_NS: Long = 20_833_333L
+
+        /** Exact 24 fps sensor cadence while recording with locked exposure. */
+        private const val CINEMATIC_FRAME_DURATION_NS: Long = 41_666_666L
 
         /** Helper data class used to hold capture metadata with their associated image */
         data class CombinedCaptureResult(

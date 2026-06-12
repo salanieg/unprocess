@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Sliding thumb of the photo/video mode switch; colour comes from
+     backgroundTintList at runtime (primary normally, the recording pulse
+     while a video is rolling). -->
+<shape xmlns:android="http://schemas.android.com/apk/res/android"
+    android:shape="oval">
+    <solid android:color="#FFFFFFFF" />
+</shape>

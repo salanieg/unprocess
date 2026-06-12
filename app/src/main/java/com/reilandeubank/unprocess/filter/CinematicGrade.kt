@@ -8,7 +8,23 @@ import kotlin.math.pow
 import kotlin.math.sqrt
 
 /**
- * One scene-adaptive cinematic grade, produced by [SceneAnalyzer.analyze]
+ * The cinematic looks the user can pick in the Select Scene menu.
+ * [BLOCKBUSTER] is the default selection.
+ */
+enum class CinematicMood(val displayName: String) {
+    GOLDEN_HOUR("Golden Hour"),
+    NEON_NIGHT("Neon Night"),
+    MOONLIGHT("Moonlight"),
+    BLOCKBUSTER("Blockbuster"),
+    GRASSLAND("Grassland"),
+    AZURE("Azure"),
+    HIGH_KEY("High Key"),
+    SILVER_SCREEN("Silver Screen"),
+    DAY_TO_NIGHT("Day to Night"),
+}
+
+/**
+ * One scene-adaptive cinematic grade, produced by [SceneAnalyzer.gradeFor]
  * from a single viewfinder frame and baked into the recording by the
  * CINEMATIC fragment shader in [AnalogLookRenderer].
  *
@@ -58,26 +74,111 @@ data class CinematicGrade(
         highlightTint[0], highlightTint[1], highlightTint[2],
         bloom, softness, vignette, grain,
     )
+
+    /**
+     * CPU rendition of the grade for the Select Scene preview tiles — the
+     * same maths as the CINEMATIC fragment shader (exposure → WB → HDR
+     * toe/shoulder → S-curve → split toning → saturation with skin
+     * protection → vignette), minus bloom/softness/grain which are
+     * invisible at tile size. Returns a new bitmap; [src] is untouched.
+     */
+    fun renderPreview(src: Bitmap): Bitmap {
+        val w = src.width
+        val h = src.height
+        val px = IntArray(w * h)
+        src.getPixels(px, 0, w, 0, 0, w, h)
+
+        val gain = Math.pow(2.0, exposure.toDouble()).toFloat()
+        val shT = shadowTint
+        val hiT = highlightTint
+        val invW = 1f / w
+        val invH = 1f / h
+
+        for (i in px.indices) {
+            val p = px[i]
+            var r = (p ushr 16 and 0xff) / 255f
+            var g = (p ushr 8 and 0xff) / 255f
+            var b = (p and 0xff) / 255f
+
+            // Linear light: exposure + white balance.
+            val lr = r * r * gain * wbRed
+            val lg = g * g * gain
+            val lb = b * b * gain * wbBlue
+            r = sqrt(max(0f, lr)); g = sqrt(max(0f, lg)); b = sqrt(max(0f, lb))
+
+            // HDR toe + shoulder (same constants as the shader).
+            r += shadowLift * 0.55f * (r + 0.05f) * (1f - r) * (1f - r)
+            g += shadowLift * 0.55f * (g + 0.05f) * (1f - g) * (1f - g)
+            b += shadowLift * 0.55f * (b + 0.05f) * (1f - b) * (1f - b)
+            r -= sq(max(r - 0.72f, 0f)) * highlightRoll * 1.7f
+            g -= sq(max(g - 0.72f, 0f)) * highlightRoll * 1.7f
+            b -= sq(max(b - 0.72f, 0f)) * highlightRoll * 1.7f
+
+            // Mid-anchored S-curve.
+            r += (r * r * (3f - 2f * r) - r) * contrast
+            g += (g * g * (3f - 2f * g) - g) * contrast
+            b += (b * b * (3f - 2f * b) - b) * contrast
+
+            // Split toning with the shader's 1.6-exponent falloff.
+            var y = (0.299f * r + 0.587f * g + 0.114f * b).coerceIn(0f, 1f)
+            val shW = Math.pow((1f - y).toDouble(), 1.6).toFloat()
+            val hiW = Math.pow(y.toDouble(), 1.6).toFloat()
+            r += shT[0] * shW + hiT[0] * hiW
+            g += shT[1] * shW + hiT[1] * hiW
+            b += shT[2] * shW + hiT[2] * hiW
+
+            // Saturation/vibrance with skin protection.
+            y = 0.299f * r + 0.587f * g + 0.114f * b
+            val mx = max(r, max(g, b))
+            val mn = min(r, min(g, b))
+            val satNow = if (mx <= 0f) 0f else (mx - mn) / mx
+            var factor = saturation + vibrance * (1f - satNow)
+            val skinW = ((r - g) * 5f).coerceIn(0f, 1f) * ((g - b) * 5f).coerceIn(0f, 1f)
+            factor += (min(factor, 1.04f) - factor) * skinW * 0.85f
+            r = y + (r - y) * factor
+            g = y + (g - y) * factor
+            b = y + (b - y) * factor
+
+            // Vignette.
+            val xN = (i % w) * invW - 0.5f
+            val yN = (i / w) * invH - 0.5f
+            val r2 = xN * xN + yN * yN
+            val vig = 1f - smoothstep(0.12f, 0.72f, r2) * vignette
+            r *= vig; g *= vig; b *= vig
+
+            px[i] = (0xff shl 24) or
+                ((r.coerceIn(0f, 1f) * 255f).toInt() shl 16) or
+                ((g.coerceIn(0f, 1f) * 255f).toInt() shl 8) or
+                (b.coerceIn(0f, 1f) * 255f).toInt()
+        }
+
+        val out = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+        out.setPixels(px, 0, w, 0, 0, w, h)
+        return out
+    }
+
+    private fun sq(v: Float) = v * v
+
+    private fun smoothstep(e0: Float, e1: Float, x: Float): Float {
+        val t = ((x - e0) / (e1 - e0)).coerceIn(0f, 1f)
+        return t * t * (3f - 2f * t)
+    }
 }
 
 /**
- * Builds a [CinematicGrade] from one viewfinder frame.
+ * Scene measurement + grade construction for the Narration looks.
  *
- * Stage 1 measures the scene: luma distribution (histogram → mean,
- * percentiles, clipping fractions), RMS contrast, colour cast, mean
- * saturation, and the fractions of skin-toned / foliage / sky / saturated
- * point-light pixels.
+ * [gradeFor] builds the grade for the user-chosen mood, adapting the
+ * mood's baseline to the measured scene (one viewfinder frame): exposure
+ * is pulled toward the mood's target brightness (only partially — AE
+ * already did the heavy lifting), the HDR toe/shoulder grow with the
+ * measured clipping, contrast complements what the scene already has, and
+ * white balance neutralises part of the cast before the mood re-applies
+ * its intended bias. Vibrance scales up on muted scenes.
  *
- * Stage 2 picks the closest cinematic mood — each mood is a different
- * answer to "how would a colourist grade this scene?" (golden-hour warmth
- * with teal shadows, neon night with halated lights, airy high key, …).
- *
- * Stage 3 adapts the mood's baseline to the measurements: exposure is
- * pulled toward the mood's target brightness (only partially — AE already
- * did the heavy lifting), the HDR toe/shoulder grow with the measured
- * shadow/highlight clipping, contrast complements what the scene already
- * has, and white balance neutralises part of the cast before the mood
- * re-applies its intended bias. Vibrance scales up on muted scenes.
+ * [baselineGrade] is the mood's un-adapted character — used for the
+ * Select Scene preview tiles and as the fallback when no frame is
+ * available.
  *
  * Pure-Kotlin pixel statistics on a 64×64 downscale — sub-millisecond
  * work, no ML runtime, identical behaviour on every device.
@@ -103,19 +204,6 @@ object SceneAnalyzer {
         var lightsFrac = 0f
     }
 
-    /** The cinematic moods the analyzer can land on. */
-    private enum class Mood(val displayName: String) {
-        GOLDEN_HOUR("Golden Hour"),
-        NEON_NIGHT("Neon Night"),
-        MOONLIGHT("Moonlight"),
-        BLOCKBUSTER("Blockbuster"),
-        VERDANT("Verdant"),
-        AZURE("Azure"),
-        HIGH_KEY("High Key"),
-        SILVER_SCREEN("Silver Screen"),
-        CLASSIC("Classic Film"),
-    }
-
     /** A mood's baseline grade before per-scene adaptation. */
     private class Baseline(
         val targetLuma: Float,
@@ -132,12 +220,36 @@ object SceneAnalyzer {
         val softness: Float,
         val vignette: Float,
         val grain: Float,
+        /** Fixed EV offset applied ON TOP of the adaptive trim — the
+         *  day-for-night underexposure lives here, outside the ±0.8 EV
+         *  clamp that keeps the other moods' trims tasteful. */
+        val evBias: Float = 0f,
     )
 
-    fun analyze(frame: Bitmap): CinematicGrade {
-        val s = measure(frame)
-        val mood = pickMood(s)
-        return buildGrade(mood, s)
+    /** Builds [mood]'s grade adapted to the scene in [frame]. */
+    fun gradeFor(mood: CinematicMood, frame: Bitmap): CinematicGrade =
+        buildGrade(mood, measure(frame))
+
+    /** [mood]'s pure baseline character, with no scene adaptation. */
+    fun baselineGrade(mood: CinematicMood): CinematicGrade {
+        val base = baselineFor(mood)
+        return CinematicGrade(
+            moodName = mood.displayName,
+            exposure = base.evBias,
+            contrast = base.contrast,
+            shadowLift = base.lift,
+            highlightRoll = base.roll,
+            wbRed = base.wbBiasR,
+            wbBlue = base.wbBiasB,
+            saturation = base.sat,
+            vibrance = base.vib,
+            shadowTint = base.shadowTint,
+            highlightTint = base.highlightTint,
+            bloom = base.bloom,
+            softness = base.softness,
+            vignette = base.vignette,
+            grain = base.grain,
+        )
     }
 
     // -------- Stage 1: measurement --------
@@ -222,109 +334,113 @@ object SceneAnalyzer {
         return 1f
     }
 
-    // -------- Stage 2: mood selection --------
+    // -------- Stage 2: mood baselines --------
 
-    private fun pickMood(s: Stats): Mood {
-        val night = s.meanLuma < 0.24f && s.p95 < 0.80f
-        val warmth = s.meanR - s.meanB
-        return when {
-            night && s.lightsFrac > 0.02f -> Mood.NEON_NIGHT
-            night -> Mood.MOONLIGHT
-            s.meanLuma > 0.62f && s.rmsContrast < 0.24f -> Mood.HIGH_KEY
-            s.skinFrac > 0.07f -> Mood.BLOCKBUSTER
-            warmth > 0.05f -> Mood.GOLDEN_HOUR
-            s.greenFrac > 0.26f -> Mood.VERDANT
-            s.skyFrac > 0.18f -> Mood.AZURE
-            s.meanSat < 0.10f -> Mood.SILVER_SCREEN
-            else -> Mood.CLASSIC
-        }
-    }
-
-    private fun baselineFor(mood: Mood): Baseline = when (mood) {
-        // Warm light kept warm; teal in the shadows against golden highlights.
-        Mood.GOLDEN_HOUR -> Baseline(
-            targetLuma = 0.46f, contrast = 0.22f, lift = 0.16f, roll = 0.50f,
-            wbBiasR = 1.05f, wbBiasB = 0.95f, sat = 1.05f, vib = 0.10f,
-            shadowTint = floatArrayOf(-0.020f, 0.004f, 0.030f),
-            highlightTint = floatArrayOf(0.030f, 0.014f, -0.022f),
-            bloom = 0.55f, softness = 0.40f, vignette = 0.26f, grain = 0.045f,
+    // Baseline strengths are tuned so the grade is unmistakable on a phone
+    // screen WITHOUT an A/B reference — the first cut (tints ≈0.02, vignette
+    // ≈0.24) was provably invisible next to an ungraded clip of the same
+    // scene. Tints sit around 0.05–0.10 and reach into the midtones (the
+    // shader applies them with a 1.6-exponent falloff), vignettes around
+    // 0.28–0.45. Skin keeps its own protection in the shader, so the
+    // stronger pushes land on the scenery, not on faces.
+    private fun baselineFor(mood: CinematicMood): Baseline = when (mood) {
+        // Warm light kept warm; deep teal shadows against golden highlights.
+        CinematicMood.GOLDEN_HOUR -> Baseline(
+            targetLuma = 0.46f, contrast = 0.32f, lift = 0.18f, roll = 0.55f,
+            wbBiasR = 1.11f, wbBiasB = 0.88f, sat = 1.14f, vib = 0.16f,
+            shadowTint = floatArrayOf(-0.058f, 0.012f, 0.084f),
+            highlightTint = floatArrayOf(0.084f, 0.038f, -0.058f),
+            bloom = 0.70f, softness = 0.45f, vignette = 0.36f, grain = 0.050f,
         )
         // Dark scene with coloured point lights: keep it dark, halate the
         // lights, push blue shadows against a magenta light response.
-        Mood.NEON_NIGHT -> Baseline(
-            targetLuma = 0.30f, contrast = 0.30f, lift = 0.10f, roll = 0.65f,
-            wbBiasR = 1.00f, wbBiasB = 1.04f, sat = 1.12f, vib = 0.16f,
-            shadowTint = floatArrayOf(-0.012f, -0.002f, 0.030f),
-            highlightTint = floatArrayOf(0.018f, -0.006f, 0.012f),
-            bloom = 0.80f, softness = 0.28f, vignette = 0.30f, grain = 0.060f,
+        CinematicMood.NEON_NIGHT -> Baseline(
+            targetLuma = 0.30f, contrast = 0.40f, lift = 0.10f, roll = 0.72f,
+            wbBiasR = 1.00f, wbBiasB = 1.09f, sat = 1.26f, vib = 0.22f,
+            shadowTint = floatArrayOf(-0.036f, -0.006f, 0.090f),
+            highlightTint = floatArrayOf(0.058f, -0.020f, 0.040f),
+            bloom = 0.92f, softness = 0.30f, vignette = 0.40f, grain = 0.065f,
         )
         // Flat dark scene without lights: day-for-night blue, soft and quiet.
-        Mood.MOONLIGHT -> Baseline(
-            targetLuma = 0.32f, contrast = 0.24f, lift = 0.22f, roll = 0.45f,
-            wbBiasR = 0.96f, wbBiasB = 1.06f, sat = 0.92f, vib = 0.06f,
-            shadowTint = floatArrayOf(-0.010f, 0.002f, 0.028f),
-            highlightTint = floatArrayOf(0.000f, 0.004f, 0.010f),
-            bloom = 0.55f, softness = 0.40f, vignette = 0.32f, grain = 0.060f,
+        CinematicMood.MOONLIGHT -> Baseline(
+            targetLuma = 0.32f, contrast = 0.32f, lift = 0.24f, roll = 0.52f,
+            wbBiasR = 0.91f, wbBiasB = 1.13f, sat = 0.80f, vib = 0.06f,
+            shadowTint = floatArrayOf(-0.032f, 0.006f, 0.084f),
+            highlightTint = floatArrayOf(0.000f, 0.012f, 0.032f),
+            bloom = 0.62f, softness = 0.45f, vignette = 0.42f, grain = 0.065f,
         )
         // People in frame: the classic teal-and-orange with protected skin.
-        Mood.BLOCKBUSTER -> Baseline(
-            targetLuma = 0.47f, contrast = 0.28f, lift = 0.18f, roll = 0.55f,
-            wbBiasR = 1.02f, wbBiasB = 0.99f, sat = 1.06f, vib = 0.12f,
-            shadowTint = floatArrayOf(-0.022f, 0.006f, 0.034f),
-            highlightTint = floatArrayOf(0.024f, 0.010f, -0.018f),
-            bloom = 0.45f, softness = 0.42f, vignette = 0.24f, grain = 0.040f,
+        CinematicMood.BLOCKBUSTER -> Baseline(
+            targetLuma = 0.47f, contrast = 0.38f, lift = 0.20f, roll = 0.62f,
+            wbBiasR = 1.05f, wbBiasB = 0.94f, sat = 1.16f, vib = 0.18f,
+            shadowTint = floatArrayOf(-0.065f, 0.018f, 0.100f),
+            highlightTint = floatArrayOf(0.072f, 0.028f, -0.052f),
+            bloom = 0.58f, softness = 0.46f, vignette = 0.32f, grain = 0.045f,
         )
-        // Foliage-dominated: forest-teal shadows under soft golden light.
-        Mood.VERDANT -> Baseline(
-            targetLuma = 0.46f, contrast = 0.22f, lift = 0.20f, roll = 0.50f,
-            wbBiasR = 1.02f, wbBiasB = 0.98f, sat = 1.04f, vib = 0.10f,
-            shadowTint = floatArrayOf(-0.014f, 0.008f, 0.020f),
-            highlightTint = floatArrayOf(0.020f, 0.012f, -0.014f),
-            bloom = 0.40f, softness = 0.38f, vignette = 0.22f, grain = 0.045f,
+        // Western "Grassland": sun-bleached prairie optics — pale, faded
+        // matte shadows tinted dusty sepia, bleached straw highlights,
+        // strongly warm/dry white balance, washed-out colour and gritty
+        // grain. Think bleach-bypass under a midday desert sun.
+        CinematicMood.GRASSLAND -> Baseline(
+            targetLuma = 0.50f, contrast = 0.34f, lift = 0.30f, roll = 0.72f,
+            wbBiasR = 1.10f, wbBiasB = 0.84f, sat = 0.85f, vib = 0.06f,
+            shadowTint = floatArrayOf(0.035f, 0.015f, -0.030f),
+            highlightTint = floatArrayOf(0.055f, 0.038f, -0.040f),
+            bloom = 0.60f, softness = 0.45f, vignette = 0.34f, grain = 0.070f,
         )
         // Big sky: clean and crisp, slate shadows, warm-white highlights.
-        Mood.AZURE -> Baseline(
-            targetLuma = 0.50f, contrast = 0.24f, lift = 0.14f, roll = 0.55f,
-            wbBiasR = 1.01f, wbBiasB = 1.01f, sat = 1.08f, vib = 0.10f,
-            shadowTint = floatArrayOf(-0.008f, 0.000f, 0.018f),
-            highlightTint = floatArrayOf(0.016f, 0.008f, -0.010f),
-            bloom = 0.40f, softness = 0.32f, vignette = 0.20f, grain = 0.038f,
+        CinematicMood.AZURE -> Baseline(
+            targetLuma = 0.50f, contrast = 0.34f, lift = 0.16f, roll = 0.62f,
+            wbBiasR = 1.03f, wbBiasB = 1.03f, sat = 1.18f, vib = 0.16f,
+            shadowTint = floatArrayOf(-0.024f, 0.000f, 0.055f),
+            highlightTint = floatArrayOf(0.050f, 0.024f, -0.031f),
+            bloom = 0.52f, softness = 0.36f, vignette = 0.28f, grain = 0.042f,
         )
         // Bright flat light: airy, low contrast, creamy highlights.
-        Mood.HIGH_KEY -> Baseline(
-            targetLuma = 0.56f, contrast = 0.14f, lift = 0.10f, roll = 0.60f,
-            wbBiasR = 1.00f, wbBiasB = 1.00f, sat = 0.98f, vib = 0.08f,
-            shadowTint = floatArrayOf(-0.006f, 0.002f, 0.012f),
-            highlightTint = floatArrayOf(0.012f, 0.008f, -0.004f),
-            bloom = 0.50f, softness = 0.50f, vignette = 0.10f, grain = 0.030f,
+        CinematicMood.HIGH_KEY -> Baseline(
+            targetLuma = 0.56f, contrast = 0.20f, lift = 0.10f, roll = 0.66f,
+            wbBiasR = 1.00f, wbBiasB = 1.00f, sat = 1.02f, vib = 0.11f,
+            shadowTint = floatArrayOf(-0.018f, 0.005f, 0.036f),
+            highlightTint = floatArrayOf(0.036f, 0.023f, -0.013f),
+            bloom = 0.62f, softness = 0.55f, vignette = 0.16f, grain = 0.034f,
         )
         // Scene is already nearly colourless: lean into it, noir-adjacent.
-        Mood.SILVER_SCREEN -> Baseline(
-            targetLuma = 0.44f, contrast = 0.32f, lift = 0.18f, roll = 0.55f,
-            wbBiasR = 1.00f, wbBiasB = 1.00f, sat = 0.82f, vib = 0.04f,
-            shadowTint = floatArrayOf(-0.008f, 0.000f, 0.016f),
-            highlightTint = floatArrayOf(0.012f, 0.008f, -0.002f),
-            bloom = 0.45f, softness = 0.40f, vignette = 0.34f, grain = 0.065f,
+        CinematicMood.SILVER_SCREEN -> Baseline(
+            targetLuma = 0.44f, contrast = 0.42f, lift = 0.20f, roll = 0.62f,
+            wbBiasR = 1.00f, wbBiasB = 1.00f, sat = 0.55f, vib = 0.04f,
+            shadowTint = floatArrayOf(-0.023f, 0.000f, 0.047f),
+            highlightTint = floatArrayOf(0.036f, 0.023f, -0.008f),
+            bloom = 0.58f, softness = 0.44f, vignette = 0.45f, grain = 0.078f,
         )
-        // Everything else: a balanced, universally flattering film grade.
-        Mood.CLASSIC -> Baseline(
-            targetLuma = 0.46f, contrast = 0.24f, lift = 0.16f, roll = 0.50f,
-            wbBiasR = 1.02f, wbBiasB = 0.99f, sat = 1.04f, vib = 0.10f,
-            shadowTint = floatArrayOf(-0.014f, 0.003f, 0.022f),
-            highlightTint = floatArrayOf(0.020f, 0.010f, -0.014f),
-            bloom = 0.45f, softness = 0.38f, vignette = 0.24f, grain = 0.045f,
+        // Day-for-night ("nuit américaine"): footage shot in daylight made
+        // to read as night, using the film industry's recipe — underexpose
+        // ~2⅓ stops (evBias, outside the adaptive clamp), crush the
+        // highlights (roll at the ceiling: nothing stays bright at night
+        // except light sources), lift the midtones a touch so the frame
+        // stays readable in the dark, cool moonlight white balance with
+        // deep blue shadows AND cool highlights, and strong desaturation
+        // (scotopic vision barely sees colour).
+        CinematicMood.DAY_TO_NIGHT -> Baseline(
+            targetLuma = 0.42f, contrast = 0.30f, lift = 0.38f, roll = 0.95f,
+            wbBiasR = 0.88f, wbBiasB = 1.15f, sat = 0.62f, vib = 0.04f,
+            shadowTint = floatArrayOf(-0.030f, 0.005f, 0.095f),
+            highlightTint = floatArrayOf(-0.010f, 0.010f, 0.050f),
+            bloom = 0.55f, softness = 0.42f, vignette = 0.46f, grain = 0.065f,
+            evBias = -2.3f,
         )
     }
 
     // -------- Stage 3: adapt the baseline to the measured scene --------
 
-    private fun buildGrade(mood: Mood, s: Stats): CinematicGrade {
+    private fun buildGrade(mood: CinematicMood, s: Stats): CinematicGrade {
         val base = baselineFor(mood)
 
         // Pull mean luma 70% of the way toward the mood's target, capped at
         // ±0.8 EV — AE already exposed the scene, this is a trim, not a fix.
+        // The mood's fixed evBias (day-for-night underexposure) rides on
+        // top, outside the clamp.
         val ev = (0.7f * (ln(base.targetLuma / max(0.04f, s.meanLuma)) / LN2))
-            .coerceIn(-0.8f, 0.8f)
+            .coerceIn(-0.8f, 0.8f) + base.evBias
 
         // HDR shaping: more shoulder when highlights clip, more toe when
         // shadows crush.
@@ -334,7 +450,7 @@ object SceneAnalyzer {
         // Contrast complements the scene toward a filmic RMS target — flat
         // scenes get snap, contrasty scenes get left alone.
         val contrast = (base.contrast + (0.20f - s.rmsContrast) * 1.1f)
-            .coerceIn(0.08f, 0.45f)
+            .coerceIn(0.12f, 0.55f)
 
         // Neutralise ~one third of the measured cast (exponent 0.35), then
         // re-apply the mood's intended bias.
@@ -345,10 +461,10 @@ object SceneAnalyzer {
 
         // Muted scenes earn extra vibrance (which spares saturated pixels).
         val vibrance = (base.vib + (0.16f - s.meanSat).coerceAtLeast(0f) * 0.7f)
-            .coerceIn(0.02f, 0.32f)
+            .coerceIn(0.02f, 0.40f)
 
         // Clipped highlights diffuse more — that's where bloom reads as cinema.
-        val bloom = (base.bloom + s.clipHi * 1.2f).coerceIn(0.20f, 0.90f)
+        val bloom = (base.bloom + s.clipHi * 1.2f).coerceIn(0.25f, 0.95f)
 
         return CinematicGrade(
             moodName = mood.displayName,
